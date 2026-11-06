@@ -168,9 +168,12 @@ ejecuta() {
     printf '\n$ (%s) ci-diagnosis %s   → código %s\n%s\n' "$dir" "$*" "$RC" "$SALIDA" >> "$LOG"
 }
 
-# espera DESCRIPCION PATRON: la última salida tiene que contener PATRON (ERE)
+# espera DESCRIPCION PATRON: la última salida tiene que contener PATRON (ERE).
+# También se busca con las líneas unidas: ci-diagnosis parte las largas.
 espera() {
-    if grep -qE -- "$2" <<< "$SALIDA"; then
+    local plano
+    plano="$(tr '\n' ' ' <<< "$SALIDA" | tr -s ' ')"
+    if grep -qE -- "$2" <<< "$SALIDA" || grep -qE -- "$2" <<< "$plano"; then
         ok "$1"
     else
         ko "$1 → no aparece: $2"
