@@ -1202,15 +1202,20 @@ def comprobar_silo(silos, uvus, home, directorio):
     esperado = os.path.join(home_r, "imagenesMV")
     nombre_esperado = "%s-imagenesMV" % uvus
     del_dir = [s for s in silos if s.real == dir_r]
+    if os.path.isdir(esperado):
+        ir_al_silo = "cd ~/imagenesMV"
+    else:
+        ir_al_silo = ("cree el directorio (mkdir ~/imagenesMV) y su silo %s, como dice "
+                      "el manual, y trabaje desde él." % nombre_esperado)
 
     if dir_r == home_r:
         rs.append(error("Está en su directorio personal, no en su silo", fallo="B2",
                         efecto="el disco y los archivos quedarían fuera del silo.",
-                        arreglo="cd ~/imagenesMV", seccion="silo"))
+                        arreglo=ir_al_silo, seccion="silo"))
     elif not del_dir:
         rs.append(error("El directorio actual (%s) no es un silo" % directorio, fallo="B2",
                         efecto="virt-install creará un silo automático sobre él.",
-                        arreglo="cd ~/imagenesMV" if dir_r != esperado
+                        arreglo=ir_al_silo if dir_r != esperado
                         else "defina el silo %s sobre este directorio." % nombre_esperado,
                         seccion="silo"))
     else:

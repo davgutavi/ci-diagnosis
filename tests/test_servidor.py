@@ -80,6 +80,12 @@ class TestSilo(ConHome):
         self.assertEqual(rs[0].fallo, "B2")
         self.assertIn("directorio personal", rs[0].texto)
 
+    def test_en_el_home_sin_imagenesmv(self):
+        # Visto con la cuenta de prueba en avantasia (6-nov): no hay ~/imagenesMV
+        os.rmdir(self.silo)
+        rs = self.revisar(directorio=self.home)
+        self.assertIn("mkdir ~/imagenesMV", rs[0].arreglo)
+
     def test_fuera_de_un_silo(self):
         otro = os.path.join(self.home, "pruebas")
         os.mkdir(otro)
