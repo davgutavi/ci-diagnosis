@@ -24,6 +24,10 @@
 #       y virt-install que el servidor) con su propio libvirt dentro, y los
 #       provoca allí. Ahí dentro no hay alumnos. Descarga la imagen de 22.04 la
 #       primera vez (unos 650 MB, se conserva en el silo). De 5 a 10 minutos.
+#   e   Los que faltaban: B9 (silo sobre un directorio que no existía), B3 con
+#       máquina (disco menor que la base, base movida), D5 (dos máquinas
+#       encendidas con la misma IP) y D6 (frase de paso tecleada mal). Unos 10
+#       minutos. Usa <usuario>-server1 y <usuario>-server2.
 #
 # Variables:
 #   CI_DIAGNOSIS=RUTA   el programa que se prueba (por defecto, ci-diagnosis en
@@ -80,6 +84,9 @@ MODO_HOME="$(stat -c %a "$HOME")"
 AGENTE_PID=""
 
 limpiar() {
+    virsh -q pool-destroy "$USUARIO-b9" >/dev/null 2>&1
+    virsh -q pool-undefine "$USUARIO-b9" >/dev/null 2>&1
+    rmdir "$HOME/imagenesMVl" 2>/dev/null
     eliminar_vm 2>/dev/null
     VM="$USUARIO-lab" eliminar_vm 2>/dev/null
     VM="$USUARIO-server2" eliminar_vm 2>/dev/null
@@ -903,12 +910,121 @@ LAB
     virsh -q dominfo "$LAB" >/dev/null 2>&1 && ko "$LAB sigue existiendo" || ok "$LAB eliminada (la imagen $JAMMY se queda en el silo)"
 }
 
+# ---------------------------------------------------------------------------
+# Fase E: B9, B3 con máquina, D5 y D6
+# ---------------------------------------------------------------------------
+fase_e() {
+    for m in "$USUARIO-server1" "$USUARIO-server2"; do
+        virsh -q dominfo "$m" >/dev/null 2>&1 && {
+            echo "Ya existe la máquina $m: elimínala antes (virsh destroy y undefine)." >&2
+            exit 1; }
+    done
+
+    titulo "E.1 Silo sobre un directorio que no existía (B9)"
+    local b9="$HOME/imagenesMVl" s="$USUARIO-b9"
+    info "como virt-manager al crear el silo: definirlo y construirlo (pool-build):"
+    { virsh -q pool-define-as "$s" dir --target "$b9" 2>&1; virsh -q pool-build "$s" 2>&1
+      virsh -q pool-start "$s" 2>&1; } | tee -a "$LOG" | sed 's/^/       | /'
+    info "el directorio: $(stat -c '%a %U:%G' "$b9" 2>&1)"
+    info "escribir en él (mensaje real):"
+    { touch "$b9/prueba" 2>&1; echo "[código $?]"; } | tee -a "$LOG" | sed 's/^/       | /'
+    info "y descargar o crear el disco allí (mensaje real):"
+    { (cd "$b9" && qemu-img create -q server1.qcow2 -f qcow2 -b "$SILO/$BASE" -F qcow2 40G) 2>&1
+      echo "[código $?]"; } | tee -a "$LOG" | sed 's/^/       | /'
+    preparar_bien
+    ejecuta "$b9" server1 --antes
+    espera "ci-diagnosis: el directorio es de root (B9)" 'es de root, no suyo|es de root.*\[B9\]|El directorio .* es de root'
+    info "el arreglo del catálogo: parar el silo, rmdir, mkdir y arrancarlo:"
+    { virsh -q pool-destroy "$s" 2>&1; rmdir "$b9" 2>&1; echo "[rmdir: código $?]"
+      mkdir "$b9" 2>&1; virsh -q pool-start "$s" 2>&1; echo "[pool-start: código $?]"
+      stat -c 'el directorio: %a %U:%G' "$b9" 2>&1; touch "$b9/prueba" 2>&1; echo "[escribir: código $?]"
+      rm -f "$b9/prueba"; } | tee -a "$LOG" | sed 's/^/       | /'
+    virsh -q pool-destroy "$s" >/dev/null 2>&1; virsh -q pool-undefine "$s" >/dev/null 2>&1
+    rmdir "$b9" 2>/dev/null
+
+    titulo "E.2 Disco más pequeño que la imagen base (B3)"
+    preparar_bien
+    (cd "$SILO" && rm -f server1.qcow2 && qemu-img create -q server1.qcow2 -f qcow2 -b "$BASE" -F qcow2 2G)
+    crear_vm
+    info "ssh (mensaje real):"
+    esperar_ssh "$HOME/.ssh/id_rsa" 120
+    info "estado: $(virsh -q domstate "$VM" 2>&1)"
+    eliminar_vm
+
+    titulo "E.3 Imagen base movida con la máquina ya creada (B3)"
+    preparar_bien
+    crear_vm
+    esperar_ssh "$HOME/.ssh/id_rsa" 180 >/dev/null
+    esperar_cloud_init
+    apagar_vm
+    mv "$SILO/$BASE" "$T/$BASE"
+    info "virsh start con la imagen base movida (mensaje real):"
+    { virsh -q start "$VM" 2>&1; echo "[código $?]"; } | tee -a "$LOG" | sed 's/^/       | /'
+    ejecuta "$SILO" server1
+    info "ci-diagnosis --acceso con la máquina apagada y sin imagen base:"
+    grep -E '^  (ERROR|AVISO)|^         ' <<< "$SALIDA" | head -8 | sed 's/^/       | /'
+    mv "$T/$BASE" "$SILO/$BASE"
+    eliminar_vm
+
+    titulo "E.4 Dos máquinas encendidas con la misma IP (D5)"
+    preparar_bien
+    crear_vm
+    esperar_ssh "$HOME/.ssh/id_rsa" 180 >/dev/null
+    local d2="$T/s2"
+    mkdir -p "$d2"
+    user_data > "$d2/user-data"
+    printf 'instance-id: %s-server2\nlocal-hostname: server2\n' "$USUARIO" > "$d2/meta-data"
+    network_config > "$d2/network-config"
+    (cd "$SILO" && qemu-img create -q server2.qcow2 -f qcow2 -b "$BASE" -F qcow2 40G)
+    salida="$(cd "$SILO" && virt-install --name="$USUARIO-server2" \
+        --cloud-init "user-data=$d2/user-data,meta-data=$d2/meta-data,network-config=$d2/network-config" \
+        --ram=2048 --vcpus=2 --import --disk path=server2.qcow2 --os-variant=ubuntu24.04 \
+        --network network="$USUARIO-red" --noautoconsole 2>&1)"
+    printf '\n$ virt-install %s-server2\n%s\n' "$USUARIO" "$salida" >> "$LOG"
+    sleep 60
+    info "con las dos encendidas, cinco ssh seguidos: ¿a cuál entra? (hostname)"
+    for i in 1 2 3 4 5; do
+        ssh -n -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "administrador@$IP_VM" hostname 2>&1 \
+            | tee -a "$LOG" | sed 's/^/       | /'
+        sleep 2
+    done
+    info "ARP del servidor para $IP_VM: $(ip neigh show "$IP_VM" 2>&1)"
+    ejecuta "$SILO" server2 --acceso
+    info "ci-diagnosis server2 --acceso:"
+    grep -E '^  (OK|ERROR|AVISO)  ' <<< "$SALIDA" | head -8 | sed 's/^/       | /'
+    VM="$USUARIO-server2" eliminar_vm
+    eliminar_vm
+
+    titulo "E.5 Frase de paso tecleada mal (D6), con un HOME aparte"
+    local h="$T/home"
+    mkdir -p -m 700 "$h/.ssh"
+    clave "$h/.ssh/id_rsa" "$USUARIO@servidor" "frase de prueba"
+    preparar_bien
+    user_data "$(cat "$h/.ssh/id_rsa.pub")" > "$SILO/user-data"
+    crear_vm
+    esperar_puerto 180 || ko "el puerto 22 no se abre"
+    esperar_cloud_init
+    printf '#!/bin/sh\necho "frase equivocada"\n' > "$T/mal"
+    chmod 700 "$T/mal"
+    info "ssh con la frase de paso equivocada (mensaje real):"
+    SSH_ASKPASS="$T/mal" SSH_ASKPASS_REQUIRE=force DISPLAY=x \
+        ssh -o IdentityAgent=none -o IdentitiesOnly=yes -i "$h/.ssh/id_rsa" \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "administrador@$IP_VM" true \
+        </dev/null 2>&1 | tee -a "$LOG" | sed 's/^/       | /'
+    SALIDA="$(cd "$SILO" && HOME="$h" SSH_AUTH_SOCK= "$PY" "$CI" server1 2>&1)"
+    printf '\n$ HOME=%s ci-diagnosis (con frase, sin agente)\n%s\n' "$h" "$SALIDA" >> "$LOG"
+    espera "ci-diagnosis: no concluyente, sin dar error de clave" 'no concluyente'
+    eliminar_vm
+}
+
 case "$FASE" in
     a) fase_a ;;
     b) fase_b ;;
     c) fase_c ;;
     d) fase_d ;;
-    *) echo "Fase desconocida: $FASE (a, b, c o d)" >&2; exit 2 ;;
+    e) fase_e ;;
+    *) echo "Fase desconocida: $FASE (a, b, c, d o e)" >&2; exit 2 ;;
 esac
 
 echo
