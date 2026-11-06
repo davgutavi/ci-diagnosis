@@ -19,6 +19,11 @@
 #       disco en uso, la clave privada con permisos abiertos y el registro de
 #       virt-install tras un error. Unos 5 minutos. Usa <usuario>-server1 y
 #       <usuario>-server2, y las elimina al terminar.
+#   d   A1 y A2, que no se pueden provocar en el servidor sin afectar a otros:
+#       crea <usuario>-lab (Ubuntu 22.04, IP .3, las mismas versiones de libvirt
+#       y virt-install que el servidor) con su propio libvirt dentro, y los
+#       provoca allí. Ahí dentro no hay alumnos. Descarga la imagen de 22.04 la
+#       primera vez (unos 650 MB, se conserva en el silo). De 5 a 10 minutos.
 #
 # Variables:
 #   CI_DIAGNOSIS=RUTA   el programa que se prueba (por defecto, ci-diagnosis en
@@ -76,6 +81,7 @@ AGENTE_PID=""
 
 limpiar() {
     eliminar_vm 2>/dev/null
+    VM="$USUARIO-lab" eliminar_vm 2>/dev/null
     VM="$USUARIO-server2" eliminar_vm 2>/dev/null
     [[ -f "$HOME/.ssh/id_rsa" ]] && chmod 600 "$HOME/.ssh/id_rsa"
     chmod "$MODO_HOME" "$HOME"
@@ -426,7 +432,7 @@ esperar_ssh() {
         if err="$(ssh -n -i "$clave" -o IdentitiesOnly=yes -o IdentityAgent=none \
                   -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no \
                   -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
-                  "administrador@$IP_VM" true 2>&1)"; then
+                  "administrador@${IP_ESPERA:-$IP_VM}" true 2>&1)"; then
             info "$ahora s: entra"
             echo "[$ahora s] entra" >> "$LOG"
             return 0
@@ -724,11 +730,182 @@ fase_c() {
     espera "ci-diagnosis --antes: «ya la creó y después la eliminó»" 'Ya la creó el .* y después la eliminó'
 }
 
+# ---------------------------------------------------------------------------
+# Fase D: A1 y A2 en un libvirt de pruebas, dentro de una máquina
+# ---------------------------------------------------------------------------
+LAB="$USUARIO-lab"
+IP_LAB="192.168.$XXX.3"
+JAMMY="jammy-server-cloudimg-amd64.img"
+URL_JAMMY="https://cloud-images.ubuntu.com/jammy/current/$JAMMY"
+
+# Órdenes dentro de la máquina de pruebas (como administrador, con sudo)
+en_lab() {
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR "administrador@$IP_LAB" "$@"
+}
+# Un script de bash dentro de la máquina, por la entrada estándar; su salida,
+# en pantalla y en el registro
+script_lab() {
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR "administrador@$IP_LAB" 'bash -s' 2>&1 | tee -a "$LOG" | sed 's/^/       | /'
+}
+# ci-diagnosis dentro de la máquina, desde su silo
+diag_lab() {
+    SALIDA="$(en_lab 'cd ~/imagenesMV && python3 ~/ci-diagnosis server1 --antes' 2>&1)"
+    printf '\n$ (lab) ci-diagnosis server1 --antes\n%s\n' "$SALIDA" >> "$LOG"
+}
+
+fase_d() {
+    virsh -q dominfo "$LAB" >/dev/null 2>&1 && {
+        echo "Ya existe la máquina $LAB: elimínala antes (virsh destroy y undefine)." >&2
+        exit 1; }
+
+    titulo "D.0 Máquina con libvirt de pruebas (Ubuntu 22.04)"
+    if [[ ! -f "$SILO/$JAMMY" ]]; then
+        info "descargando $JAMMY..."
+        wget -q -O "$SILO/$JAMMY" "$URL_JAMMY" || { ko "no se pudo descargar $JAMMY"; return; }
+    fi
+    local d="$T/lab"
+    mkdir -p "$d"
+    cat > "$d/user-data" <<FIN
+#cloud-config
+users:
+  - name: administrador
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    groups: sudo
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - $PUB
+package_update: true
+packages: [libvirt-daemon-system, virtinst, python3-libvirt, python3-yaml, qemu-utils]
+runcmd:
+  - [usermod, -aG, libvirt, administrador]
+FIN
+    printf 'instance-id: %s\nlocal-hostname: lab\n' "$LAB" > "$d/meta-data"
+    network_config "$IP_LAB/24" > "$d/network-config"
+    (cd "$SILO" && rm -f lab.qcow2 && qemu-img create -q lab.qcow2 -f qcow2 -b "$JAMMY" -F qcow2 20G)
+    salida="$(cd "$SILO" && virt-install --name="$LAB" \
+        --cloud-init "user-data=$d/user-data,meta-data=$d/meta-data,network-config=$d/network-config" \
+        --ram=2048 --vcpus=2 --import --disk path=lab.qcow2 --os-variant=ubuntu22.04 \
+        --network network="$USUARIO-red" --noautoconsole 2>&1)"; rc=$?
+    printf '\n$ virt-install %s\n%s\n' "$LAB" "$salida" >> "$LOG"
+    [[ "$rc" == 0 ]] && ok "virt-install crea $LAB" || { ko "virt-install falla (ver el registro)"; return; }
+    IP_ESPERA="$IP_LAB" esperar_ssh "$HOME/.ssh/id_rsa" 180 >/dev/null || { ko "no se puede entrar en $LAB"; return; }
+    info "esperando a que cloud-init instale libvirt (unos minutos)..."
+    en_lab 'cloud-init status --wait' >>"$LOG" 2>&1
+    en_lab 'sudo reboot' >/dev/null 2>&1    # para que valga el grupo libvirt
+    sleep 20
+    IP_ESPERA="$IP_LAB" esperar_ssh "$HOME/.ssh/id_rsa" 180 >/dev/null || { ko "no vuelve tras reiniciar"; return; }
+    scp -q -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        "$CI" "administrador@$IP_LAB:ci-diagnosis"
+    info "versiones dentro:"
+    script_lab <<'LAB'
+lsb_release -ds
+virsh -c qemu:///system --version
+virt-install --version
+python3 -c 'import libvirt, yaml; print("python3-libvirt", libvirt.getVersion(), "PyYAML", yaml.__version__)'
+id
+LAB
+    info "silo, red y archivos del alumno de prueba dentro:"
+    script_lab <<'LAB'
+V="virsh -q -c qemu:///system"
+mkdir -p ~/imagenesMV && cd ~/imagenesMV
+$V pool-define-as administrador-imagenesMV dir --target "$HOME/imagenesMV" >/dev/null
+$V pool-start administrador-imagenesMV >/dev/null && $V pool-autostart administrador-imagenesMV >/dev/null
+cat > /tmp/red.xml <<XML
+<network><name>administrador-red</name><forward mode='nat'/>
+<ip address='192.168.150.1' netmask='255.255.255.0'><dhcp><range start='192.168.150.128' end='192.168.150.254'/></dhcp></ip></network>
+XML
+$V net-define /tmp/red.xml >/dev/null && $V net-start administrador-red >/dev/null && $V net-autostart administrador-red >/dev/null
+qemu-img create -q -f qcow2 server1.qcow2 1G
+printf '#cloud-config\n' > user-data
+printf 'instance-id: administrador-server1\nlocal-hostname: server1\n' > meta-data
+printf 'version: 2\n' > network-config
+$V pool-list --all; $V net-list --all
+LAB
+
+    titulo "D.1 Silo de otro usuario con un nombre que no es UTF-8 (A1)"
+    script_lab <<'LAB'
+V="virsh -q -c qemu:///system"
+sudo mkdir -p /home/otro
+sudo touch "/home/otro/$(printf 'datos\xc3')" /home/otro/normal.img
+$V pool-define-as otro dir --target /home/otro >/dev/null && $V pool-start otro >/dev/null
+echo "--- virt-install (mensaje real):"
+cd ~/imagenesMV && virt-install --name=administrador-server1 \
+    --cloud-init user-data=user-data,meta-data=meta-data,network-config=network-config \
+    --ram=2048 --vcpus=2 --import --disk path=server1.qcow2 --os-variant=ubuntu24.04 \
+    --network network=administrador-red --noautoconsole 2>&1; echo "[código $?]"
+echo "--- qué llamada de libvirt falla (python3-libvirt):"
+python3 - <<'PY'
+import libvirt
+c = libvirt.openReadOnly("qemu:///system")
+p = c.storagePoolLookupByName("otro")
+try:
+    vols = p.listAllVolumes(0)
+except Exception as e:
+    print("listAllVolumes:", type(e).__name__, e); raise SystemExit
+for v in vols:
+    for nombre, f in (("name", lambda: v.name()), ("XMLDesc", lambda: v.XMLDesc(0))):
+        try:
+            f(); print(nombre, "ok")
+        except Exception as e:
+            print(nombre, type(e).__name__, e)
+PY
+LAB
+    diag_lab
+    espera "ci-diagnosis: el silo otro hace fallar a virt-install" 'El silo otro de otro usuario hace fallar a virt-install \[A1\]'
+    espera "...y le dice que avise al profesor" 'avise al profesor'
+
+    titulo "D.2 El mismo archivo en el silo del alumno (A1)"
+    script_lab <<'LAB'
+V="virsh -q -c qemu:///system"
+$V pool-destroy otro >/dev/null; $V pool-undefine otro >/dev/null
+touch ~/imagenesMV/"$(printf 'datos\xc3')"
+$V pool-refresh administrador-imagenesMV >/dev/null
+echo "--- virt-install (mensaje real):"
+cd ~/imagenesMV && virt-install --name=administrador-server1 \
+    --cloud-init user-data=user-data,meta-data=meta-data,network-config=network-config \
+    --ram=2048 --vcpus=2 --import --disk path=server1.qcow2 --os-variant=ubuntu24.04 \
+    --network network=administrador-red --noautoconsole 2>&1; echo "[código $?]"
+LAB
+    diag_lab
+    espera "ci-diagnosis: su propio silo hace fallar a virt-install" 'Su silo administrador-imagenesMV hace fallar a virt-install para todos \[A1\]'
+    espera "...y le dice qué archivo es" 'datos\\303'
+    en_lab 'rm -f ~/imagenesMV/datos* && virsh -q -c qemu:///system pool-refresh administrador-imagenesMV' >/dev/null 2>&1
+
+    titulo "D.3 Dos redes con la misma subred (A2)"
+    script_lab <<'LAB'
+V="virsh -q -c qemu:///system"
+sed 's/administrador-red/otra-red/' /tmp/red.xml > /tmp/otra.xml
+echo "--- definir otra red con la misma subred (la del alumno, activa):"
+$V net-define /tmp/otra.xml 2>&1; echo "[código $?]"
+echo "--- arrancar la otra (mensaje real):"
+$V net-start otra-red 2>&1; echo "[código $?]"
+LAB
+    diag_lab
+    espera "ci-diagnosis: la otra red parada usa su subred (AVISO A2)" 'AVISO  La red otra-red usa la misma subred que la suya \[A2\]'
+    script_lab <<'LAB'
+V="virsh -q -c qemu:///system"
+$V net-destroy administrador-red >/dev/null
+echo "--- con la del alumno parada, arrancar la otra:"
+$V net-start otra-red 2>&1; echo "[código $?]"
+echo "--- arrancar la del alumno (mensaje real):"
+$V net-start administrador-red 2>&1; echo "[código $?]"
+LAB
+    diag_lab
+    espera "ci-diagnosis: la otra, activa, impide arrancar la suya (ERROR A2)" 'ERROR  La red otra-red usa la misma subred que la suya \[A2\]'
+
+    titulo "D.4 Eliminar la máquina de pruebas"
+    VM="$LAB" eliminar_vm
+    virsh -q dominfo "$LAB" >/dev/null 2>&1 && ko "$LAB sigue existiendo" || ok "$LAB eliminada (la imagen $JAMMY se queda en el silo)"
+}
+
 case "$FASE" in
     a) fase_a ;;
     b) fase_b ;;
     c) fase_c ;;
-    *) echo "Fase desconocida: $FASE (a, b o c)" >&2; exit 2 ;;
+    d) fase_d ;;
+    *) echo "Fase desconocida: $FASE (a, b, c o d)" >&2; exit 2 ;;
 esac
 
 echo
