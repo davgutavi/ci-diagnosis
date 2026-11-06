@@ -242,6 +242,19 @@ class TestOpciones(unittest.TestCase):
         self.assertIn("IP 192.168.7.5 (de --ip)", salida)
         self.assertEqual(codigo, 0, salida)
 
+    @necesita_yaml
+    def test_acceso_con_eth0_prueba_la_ip(self):
+        # Visto en avantasia (fase b, B.4): con eth0 decía que meta-data era de otra máquina
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.realpath(tmp)
+            silo, conn = self.con_maquina(home, activo=True)
+            escribir(os.path.join(silo, "network-config"),
+                     NETWORK_CONFIG.replace("enp1s0", "eth0"))
+            _, salida, _ = self.ejecutar_en(home, silo, conn, puerto="sin respuesta")
+        self.assertIn("IP 192.168.7.2 (de network-config)", salida)
+        self.assertIn("Connection timed out", salida)
+        self.assertNotIn("de otra máquina", salida)
+
     def test_acceso_sin_maquina(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = os.path.realpath(tmp)

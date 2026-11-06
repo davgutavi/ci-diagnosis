@@ -151,7 +151,11 @@ def comprobar_conectividad(ip):
                         seccion="acceso"))
     else:
         rs.append(error("La máquina no contesta en el puerto 22 de %s" % ip, fallo="D1",
-                        detalle=[espere], seccion="acceso"))
+                        detalle=["ssh dice «Connection timed out» (o, si se espera más, "
+                                 "«No route to host»).", espere],
+                        efecto="nada responde en esa IP: la máquina aún arranca, o "
+                               "network-config no le ha dado esa IP (B6).",
+                        seccion="acceso"))
     return rs, False
 
 

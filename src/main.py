@@ -141,15 +141,24 @@ def _meta_del_silo(directorio):
 
 
 def _ip_de_network_config(directorio):
+    """La IP fija de network-config: la de enp1s0 o, si no la tiene, la de la
+    primera interfaz (con eth0 la máquina no la tendrá, pero es la que se espera)."""
     datos = leer_bytes(os.path.join(directorio, "network-config"))
     if datos is None or yaml is None:
         return None
     try:
-        red = yaml.safe_load(datos.decode("utf-8", "replace"))
-        direccion = red["ethernets"][INTERFAZ]["addresses"][0]
-        return ipaddress.ip_interface(str(direccion)).ip
+        ethernets = yaml.safe_load(datos.decode("utf-8", "replace"))["ethernets"]
+        nombres = [INTERFAZ] + [n for n in ethernets if n != INTERFAZ]
+        for nombre in nombres:
+            if isinstance(ethernets.get(nombre), dict):
+                for direccion in _como_lista(ethernets[nombre].get("addresses")):
+                    try:
+                        return ipaddress.ip_interface(str(direccion)).ip
+                    except ValueError:
+                        continue
     except Exception:
-        return None
+        pass
+    return None
 
 
 def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
@@ -182,9 +191,14 @@ def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
     entra = False
     if m.encendida:
         if ip is None:
+            if iid == nombre:
+                motivo = "network-config no tiene una dirección IP válida"
+            elif iid:
+                motivo = "el meta-data del silo es de otra máquina (%s)" % iid
+            else:
+                motivo = "no hay meta-data en este directorio"
             informe.bloque("Conectividad", [omitida(
-                "No se sabe la IP de la máquina: el meta-data del silo es de otra máquina. "
-                "Indíquela con --ip")])
+                "No se sabe la IP de la máquina: %s. Indíquela con --ip" % motivo)])
         else:
             res_con, abierto = comprobar_conectividad(ip)
             informe.bloque("Conectividad", [ok("IP %s (de %s)" % (ip, origen))] + res_con)
