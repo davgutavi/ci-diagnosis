@@ -1,0 +1,14 @@
+# Instrucciones para Claude Code: no van al repositorio
+CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Grabaciones y resultados de las pruebas en el servidor
+*.log
+sonda-*.txt
+
+# macOS
+.DS_Store
