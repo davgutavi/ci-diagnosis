@@ -21,8 +21,11 @@ class _Simulado:
 
 
 class Volumen(_Simulado):
-    def __init__(self, nombre, roto=False):
-        self._nombre, self._roto = nombre, roto
+    """roto: nombre que no es UTF-8 (A1). borrado: el archivo se borró con rm y
+    libvirt aún lo tiene en su lista (XMLDesc da un error de libvirt)."""
+
+    def __init__(self, nombre, roto=False, borrado=False):
+        self._nombre, self._roto, self._borrado = nombre, roto, borrado
 
     def _comprobar(self):
         if self._roto:   # Como el binding de Python con un nombre que no es UTF-8
@@ -34,6 +37,8 @@ class Volumen(_Simulado):
 
     def XMLDesc(self, flags=0):
         self._comprobar()
+        if self._borrado:
+            raise libvirtError("Storage volume not found: no storage vol with matching path")
         return "<volume><name>%s</name></volume>" % self._nombre
 
 

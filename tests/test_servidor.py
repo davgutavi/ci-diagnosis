@@ -59,6 +59,12 @@ class TestEntornoCompartido(ConHome):
         rs = self.revisar(fl.Silo(UVUS, self.home, volumenes=[fl.Volumen("x", roto=True)]))
         self.assertIn("Su silo", rs[0].texto)
 
+    def test_volumen_borrado_con_rm_no_es_a1(self):
+        # Visto en avantasia (fase c, 6-nov): virt-install lo captura y sigue
+        rs = self.revisar(self.mi_silo(volumenes=[fl.Volumen("otra.qcow2", borrado=True),
+                                                  fl.Volumen("server1.qcow2")]))
+        self.assertEqual(problemas(rs), [])
+
     def test_inactivos_no_cuentan(self):
         rs = self.revisar(fl.Silo("otro", "/home/otro", activo=False,
                                   volumenes=[fl.Volumen("x", roto=True)]))
