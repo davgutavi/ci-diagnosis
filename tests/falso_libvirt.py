@@ -86,8 +86,13 @@ class Red(_Simulado):
 
 
 class Dominio(_Simulado):
-    def __init__(self, nombre, discos=(), activo=False):
+    """Una máquina. activo=True: encendida (estado 1); si no, apagada (5)."""
+
+    def __init__(self, nombre, discos=(), activo=False, red=None, on_reboot="restart",
+                 iso=False, memoria_kib=2097152, vcpus=2, arp=None):
         self._nombre, self._discos, self._activo = nombre, list(discos), activo
+        self._red, self._on_reboot, self._iso = red, on_reboot, iso
+        self._memoria, self._vcpus, self._arp = memoria_kib, vcpus, arp
 
     def name(self):
         return self._nombre
@@ -95,10 +100,28 @@ class Dominio(_Simulado):
     def XMLDesc(self, flags=0):
         discos = "".join("<disk type='file' device='disk'><source file='%s'/></disk>" % d
                          for d in self._discos)
-        return "<domain><name>%s</name><devices>%s</devices></domain>" % (self._nombre, discos)
+        if self._iso:
+            discos += ("<disk type='file' device='cdrom'><source file='/var/lib/libvirt/"
+                       "boot/virtinst-abcdefgh-cloudinit.iso'/></disk>")
+        red = ("<interface type='network'><source network='%s'/></interface>" % self._red
+               if self._red else "")
+        return ("<domain><name>%s</name><memory unit='KiB'>%d</memory><vcpu>%d</vcpu>"
+                "<on_reboot>%s</on_reboot><devices>%s%s</devices></domain>"
+                % (self._nombre, self._memoria, self._vcpus, self._on_reboot, discos, red))
 
     def isActive(self):
         return int(self._activo)
+
+    def state(self, flags=0):
+        return [1 if self._activo else 5, 1]
+
+    def interfaceAddresses(self, source, flags=0):
+        if source != 2:   # solo ARP: el agente necesita una conexión de escritura
+            raise AssertionError("interfaceAddresses con una fuente que no es ARP")
+        if self._arp is None:
+            raise libvirtError("no hay entradas ARP")
+        return {"vnet0": {"hwaddr": "52:54:00:00:00:01",
+                          "addrs": [{"type": 0, "addr": self._arp, "prefix": 0}]}}
 
 
 class Conexion(_Simulado):

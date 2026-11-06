@@ -125,6 +125,110 @@ def diagnosticar_antes(uvus, home, directorio, maquina, conn=None):
     return informe, maquina, existe
 
 
+def _meta_del_silo(directorio):
+    """(local-hostname, instance-id) de meta-data, o (None, None)."""
+    datos = leer_bytes(os.path.join(directorio, "meta-data"))
+    if datos is None or yaml is None:
+        return None, None
+    try:
+        meta = yaml.safe_load(datos.decode("utf-8", "replace").lstrip("\ufeff"))
+    except yaml.YAMLError:
+        return None, None
+    if not isinstance(meta, dict):
+        return None, None
+    host, iid = meta.get("local-hostname"), meta.get("instance-id")
+    return (str(host) if host else None), (str(iid) if iid else None)
+
+
+def _ip_de_network_config(directorio):
+    datos = leer_bytes(os.path.join(directorio, "network-config"))
+    if datos is None or yaml is None:
+        return None
+    try:
+        red = yaml.safe_load(datos.decode("utf-8", "replace"))
+        direccion = red["ethernets"][INTERFAZ]["addresses"][0]
+        return ipaddress.ip_interface(str(direccion)).ip
+    except Exception:
+        return None
+
+
+def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
+    """Revisión de una máquina ya creada en la que no se puede entrar."""
+    informe = Informe()
+    nombre = "%s-%s" % (uvus, maquina)
+    dominio = buscar_dominio(conn, nombre)
+    if dominio is None:
+        informe.bloque("Máquina", [error(
+            "No existe la máquina %s" % nombre,
+            arreglo="si todavía no la ha creado, revise antes su trabajo con "
+                    "ci-diagnosis --antes.", seccion="instanciar")])
+        return informe
+    m = Maquina(dominio)
+    informe.bloque("Máquina", comprobar_maquina(m, uvus))
+    res_claves, clave = comprobar_claves(home)
+    res_red, red = comprobar_red(conn, uvus)
+    problemas_red = [r for r in res_red if r.estado in (ERROR, AVISO)]
+    if problemas_red:
+        informe.bloque("Red", problemas_red)
+
+    # La IP: la indicada, la de network-config si es de esta máquina, o la de ARP
+    _, iid = _meta_del_silo(directorio)
+    ip, origen = ip_forzada, "--ip"
+    if ip is None and iid == nombre:
+        ip, origen = _ip_de_network_config(directorio), "network-config"
+    if ip is None and m.encendida:
+        ip, origen = ip_por_arp(dominio), "las tablas ARP del servidor"
+
+    entra = False
+    if m.encendida:
+        if ip is None:
+            informe.bloque("Conectividad", [omitida(
+                "No se sabe la IP de la máquina: el meta-data del silo es de otra máquina. "
+                "Indíquela con --ip")])
+        else:
+            res_con, abierto = comprobar_conectividad(ip)
+            informe.bloque("Conectividad", [ok("IP %s (de %s)" % (ip, origen))] + res_con)
+            if abierto:
+                cifrada, en_agente = estado_de_la_clave(home)
+                res_ssh, entra = comprobar_ssh(ip, home, cifrada, en_agente)
+                informe.bloque("Acceso por SSH", res_ssh)
+        if not entra:
+            informe.bloque("Disco de la máquina", [omitida(
+                "Para revisar su disco, apáguela (virsh shutdown %s), espere a que "
+                "virsh domstate %s diga «shut off» y vuelva a ejecutar ci-diagnosis"
+                % (nombre, nombre))])
+    elif m.apagada:
+        informe.bloque("Conectividad", [omitida("Conectividad y SSH: la máquina está apagada")])
+        informe.bloque("Disco de la máquina", revisar_disco(conn, m, clave, directorio,
+                                                            iid, red))
+    if not entra:
+        informe.bloque("Orden de virt-install", comprobar_orden(home, uvus, nombre))
+        res_archivos, _, _ = diagnosticar_archivos(uvus, directorio, maquina, clave, red)
+        informe.bloque("Archivos de cloud-init (en el silo)", res_archivos)
+    informe.bloque("Claves SSH", res_claves)
+    return informe
+
+
+def revisar_disco(conn, maquina, clave, directorio, iid, red):
+    if not maquina.discos:
+        return [error("La máquina no tiene ningún disco", seccion="instanciar")]
+    disco = maquina.discos[0]
+    for d in conn.listAllDomains(0):
+        if d.name() != maquina.nombre and d.isActive() and disco in discos_de(d):
+            return [error("El disco lo está usando la máquina encendida %s" % d.name(),
+                          fallo="C2", seccion="instanciar")]
+    previo = comprobar_libguestfs()
+    if previo is not None and previo.estado == ERROR:
+        return [previo]
+    archivos, instancias, problema = leer_disco(disco)
+    if problema is not None:
+        return [problema]
+    actual = leer_bytes(os.path.join(directorio, "user-data"))
+    actual = actual.decode("utf-8", "replace") if actual is not None else None
+    rs = [ok("Disco leído: %s" % disco)] + ([previo] if previo else [])
+    return rs + comprobar_disco(archivos, instancias, clave, actual, iid, red)
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     for flujo in (sys.stdout, sys.stderr):
@@ -144,10 +248,6 @@ def main(argv=None):
     if opciones["version"]:
         print("ci-diagnosis %s" % VERSION)
         return 0
-    if opciones["modo"] == "acceso":
-        print("ci-diagnosis: --acceso todavía no está disponible.", file=sys.stderr)
-        return 2
-
     # El usuario de la cuenta, no el de las variables de entorno. Para las
     # pruebas locales se puede fijar con CI_DIAGNOSIS_USUARIO.
     uvus = (os.environ.get("CI_DIAGNOSIS_USUARIO")
@@ -163,7 +263,22 @@ def main(argv=None):
               file=sys.stderr)
         return 2
     try:
-        informe, maquina, existe = diagnosticar_antes(uvus, home, directorio, maquina, conn)
+        if maquina is None:
+            maquina = normalizar_maquina(_meta_del_silo(directorio)[0], uvus)
+        modo = opciones["modo"]
+        if modo is None:
+            existe = maquina is not None and buscar_dominio(
+                conn, "%s-%s" % (uvus, maquina)) is not None
+            modo = "acceso" if existe else "antes"
+        if modo == "acceso":
+            if maquina is None:
+                print("ci-diagnosis: indique qué máquina quiere revisar "
+                      "(por ejemplo: ci-diagnosis server1 --acceso).", file=sys.stderr)
+                return 2
+            informe = diagnosticar_acceso(uvus, home, directorio, maquina, conn,
+                                          opciones["ip"])
+        else:
+            informe, maquina, _ = diagnosticar_antes(uvus, home, directorio, maquina, conn)
     finally:
         try:
             conn.close()
@@ -173,10 +288,12 @@ def main(argv=None):
     servidor = os.uname().nodename.split(".")[0]
     print("ci-diagnosis %s · %s · usuario: %s · máquina: %s" % (
         VERSION, servidor, uvus, "%s-%s" % (uvus, maquina) if maquina else "sin determinar"))
-    print("Modo: antes de virt-install")
-    if existe and opciones["modo"] is None:
-        print("(La máquina ya existe. La revisión --acceso, para cuando no puede "
-              "entrar en ella, todavía no está disponible.)")
+    if modo == "acceso":
+        print("Modo: no puede entrar en la máquina (--acceso)")
+        if opciones["modo"] is None:
+            print("(La máquina ya existe. Para revisarla como antes de crearla: --antes)")
+    else:
+        print("Modo: antes de virt-install (--antes)")
     print("(Versión en desarrollo.)")
     print()
     for linea in formatear_informe(informe, usar_color(sys.stdout)):

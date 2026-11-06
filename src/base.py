@@ -17,6 +17,7 @@ import json
 import os
 import pwd
 import re
+import socket
 import stat
 import struct
 import subprocess
@@ -166,8 +167,11 @@ ORDENES_PERMITIDAS = ("qemu-img", "ssh-keygen", "ssh", "ssh-add", "ping",
                       "guestfish", "virt-cat", "virt-ls")
 
 
-def ejecutar(argv, timeout=30):
+def ejecutar(argv, timeout=30, entrada=None):
     """Ejecuta una orden de la lista blanca, sin teclado y con LC_ALL=C.
+
+    entrada: texto que recibe por la entrada estándar (lo usa guestfish para
+    leer sus órdenes); sin ella, la entrada es /dev/null.
 
     Devuelve (código, salida, errores). El código es None si la orden no existe
     o no termina a tiempo.
@@ -175,9 +179,11 @@ def ejecutar(argv, timeout=30):
     if argv[0] not in ORDENES_PERMITIDAS:
         raise ValueError("orden no permitida: %s" % argv[0])
     entorno = dict(os.environ, LC_ALL="C", LANG="C")
+    extra = ({"input": entrada.encode("utf-8")} if entrada is not None
+             else {"stdin": subprocess.DEVNULL})
     try:
-        p = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, env=entorno, timeout=timeout)
+        p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           env=entorno, timeout=timeout, **extra)
     except (OSError, subprocess.TimeoutExpired):
         return None, "", ""
     return (p.returncode, p.stdout.decode("utf-8", "replace"),

@@ -18,6 +18,7 @@ import json
 import os
 import pwd
 import re
+import socket
 import stat
 import struct
 import subprocess
@@ -167,8 +168,11 @@ ORDENES_PERMITIDAS = ("qemu-img", "ssh-keygen", "ssh", "ssh-add", "ping",
                       "guestfish", "virt-cat", "virt-ls")
 
 
-def ejecutar(argv, timeout=30):
+def ejecutar(argv, timeout=30, entrada=None):
     """Ejecuta una orden de la lista blanca, sin teclado y con LC_ALL=C.
+
+    entrada: texto que recibe por la entrada estándar (lo usa guestfish para
+    leer sus órdenes); sin ella, la entrada es /dev/null.
 
     Devuelve (código, salida, errores). El código es None si la orden no existe
     o no termina a tiempo.
@@ -176,9 +180,11 @@ def ejecutar(argv, timeout=30):
     if argv[0] not in ORDENES_PERMITIDAS:
         raise ValueError("orden no permitida: %s" % argv[0])
     entorno = dict(os.environ, LC_ALL="C", LANG="C")
+    extra = ({"input": entrada.encode("utf-8")} if entrada is not None
+             else {"stdin": subprocess.DEVNULL})
     try:
-        p = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, env=entorno, timeout=timeout)
+        p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           env=entorno, timeout=timeout, **extra)
     except (OSError, subprocess.TimeoutExpired):
         return None, "", ""
     return (p.returncode, p.stdout.decode("utf-8", "replace"),
@@ -446,6 +452,25 @@ def _listar(directorio):
         return os.listdir(directorio)
     except OSError:
         return []
+
+
+def estado_de_la_clave(home):
+    """(cifrada, en el agente) de ~/.ssh/id_rsa, para interpretar ssh (D6)."""
+    datos = leer_bytes(os.path.join(home, ".ssh", "id_rsa"))
+    if datos is None:
+        return None, False
+    _, cifrada, publica = analizar_privada(datos)
+    del datos
+    if publica is None:
+        pub = leer_bytes(os.path.join(home, ".ssh", "id_rsa.pub"))
+        publica = analizar_clave_publica(pub.decode("utf-8", "replace")) if pub else None
+    if not os.environ.get("SSH_AUTH_SOCK") or publica is None:
+        return cifrada, False
+    codigo, salida, _ = ejecutar(["ssh-add", "-L"], timeout=10)
+    if codigo != 0:
+        return cifrada, False
+    cargadas = [analizar_clave_publica(l) for l in salida.splitlines()]
+    return cifrada, any(c and c.blob == publica.blob for c in cargadas)
 
 
 def comprobar_agente(clave):
@@ -1646,6 +1671,518 @@ def comprobar_permisos(directorio):
     return [ok("%s puede llegar hasta %s" % (USUARIO_QEMU, directorio))]
 
 
+# --- Cuando no puede entrar: estado, conectividad, SSH y orden de virt-install --
+#
+# D1, D3, D4, D6 y C1. Nunca arranca ni apaga la máquina: si hace falta que esté
+# apagada (para leer el disco), se le pide al alumno.
+
+ESTADO_ENCENDIDA = 1
+ESTADO_PAUSADA = 3
+ESTADO_APAGADA = 5
+NOMBRES_ESTADO = {0: "sin estado", 1: "encendida", 2: "bloqueada", 3: "en pausa",
+                  4: "apagándose", 5: "apagada", 6: "caída", 7: "suspendida"}
+FUENTE_ARP = 2   # VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_ARP
+
+
+def buscar_dominio(conn, nombre):
+    for d in conn.listAllDomains(0):
+        if d.name() == nombre:
+            return d
+    return None
+
+
+class Maquina:
+    """Lo que hace falta saber de la máquina, leído de su definición."""
+
+    def __init__(self, dominio):
+        self.dominio = dominio
+        self.nombre = dominio.name()
+        estado = dominio.state()
+        self.estado = estado[0] if isinstance(estado, (list, tuple)) else estado
+        raiz = _xml(dominio)
+        self.on_reboot = raiz.findtext("on_reboot")
+        self.redes = [i.find("source").get("network")
+                      for i in raiz.findall("devices/interface")
+                      if i.get("type") == "network" and i.find("source") is not None]
+        self.discos = discos_de(dominio)
+        self.iso_cloud_init = any(
+            "cloudinit" in (d.find("source").get("file") or "")
+            for d in raiz.findall("devices/disk")
+            if d.get("device") == "cdrom" and d.find("source") is not None)
+        memoria = raiz.find("memory")
+        self.memoria_mib = None
+        if memoria is not None and (memoria.text or "").isdigit():
+            factor = {"KiB": 1 / 1024, "MiB": 1, "GiB": 1024}.get(memoria.get("unit", "KiB"))
+            if factor:
+                self.memoria_mib = int(int(memoria.text) * factor)
+        vcpu = raiz.findtext("vcpu")
+        self.vcpus = int(vcpu) if vcpu and vcpu.strip().isdigit() else None
+
+    @property
+    def encendida(self):
+        return self.estado == ESTADO_ENCENDIDA
+
+    @property
+    def apagada(self):
+        return self.estado == ESTADO_APAGADA
+
+
+def comprobar_maquina(maquina, uvus):
+    """D3 y lo esperado por el manual (5.4.2)."""
+    rs = []
+    nombre_estado = NOMBRES_ESTADO.get(maquina.estado, str(maquina.estado))
+    if maquina.encendida:
+        rs.append(ok("La máquina %s está encendida" % maquina.nombre))
+    elif maquina.apagada:
+        rs.append(ok("La máquina %s está apagada" % maquina.nombre))
+    else:
+        rs.append(aviso("La máquina %s está %s" % (maquina.nombre, nombre_estado),
+                        arreglo="apáguela (virsh shutdown %s) y vuelva a arrancarla "
+                                "(virsh start %s)." % (maquina.nombre, maquina.nombre),
+                        seccion="acceso"))
+    red = "%s-red" % uvus
+    if red not in maquina.redes:
+        rs.append(error("La máquina no está conectada a su red %s" % red,
+                        detalle=["Está en: %s." % ", ".join(maquina.redes)]
+                        if maquina.redes else ["No tiene ninguna red."],
+                        efecto="la IP de network-config no le sirve en esa red.",
+                        arreglo="vuelva a crearla con --network network=%s." % red,
+                        seccion="instanciar"))
+    else:
+        rs.append(ok("Está conectada a su red %s" % red))
+    if maquina.encendida and maquina.on_reboot == "destroy":
+        rs.append(aviso(
+            "Todavía tiene la configuración del primer arranque", fallo="D3",
+            efecto="si la reinicia desde dentro, se apagará en vez de reiniciarse.",
+            arreglo="cuando haya entrado e instalado qemu-guest-agent, apáguela con "
+                    "virsh shutdown %s y arránquela con virsh start %s."
+                    % (maquina.nombre, maquina.nombre),
+            seccion="acceso"))
+    if maquina.memoria_mib is not None and maquina.memoria_mib != 2048:
+        rs.append(aviso("La máquina tiene %d MiB de RAM; el manual pide 2048"
+                        % maquina.memoria_mib, seccion="instanciar"))
+    if maquina.vcpus is not None and maquina.vcpus != 2:
+        rs.append(aviso("La máquina tiene %d vCPU; el manual pide 2" % maquina.vcpus,
+                        seccion="instanciar"))
+    return rs
+
+
+def ip_por_arp(dominio):
+    """IPv4 que ve el servidor en sus tablas ARP para la máquina, o None."""
+    try:
+        datos = dominio.interfaceAddresses(FUENTE_ARP, 0)
+    except Exception:
+        return None
+    for interfaz in (datos or {}).values():
+        for direccion in interfaz.get("addrs") or []:
+            if direccion.get("type") == 0:   # VIR_IP_ADDR_TYPE_IPV4
+                try:
+                    return ipaddress.ip_address(direccion.get("addr"))
+                except ValueError:
+                    continue
+    return None
+
+
+def probar_puerto(ip, puerto=22, espera=5):
+    """'abierto', 'rechazado', 'sin ruta' o 'sin respuesta'."""
+    try:
+        s = socket.create_connection((str(ip), puerto), timeout=espera)
+        s.close()
+        return "abierto"
+    except ConnectionRefusedError:
+        return "rechazado"
+    except socket.timeout:
+        return "sin respuesta"
+    except OSError as e:
+        return "sin ruta" if e.errno in (113, 101) else "sin respuesta"   # EHOSTUNREACH, ENETUNREACH
+
+
+def comprobar_conectividad(ip):
+    """D1 y B6. Devuelve (resultados, el puerto 22 está abierto)."""
+    rs = []
+    if responde_ping(ip):
+        rs.append(ok("La máquina responde en %s" % ip))
+    else:
+        rs.append(aviso("La máquina no responde al ping en %s" % ip,
+                        efecto="o todavía está arrancando, o no tiene esa IP."))
+    puerto = probar_puerto(ip)
+    if puerto == "abierto":
+        rs.append(ok("El puerto 22 (ssh) está abierto"))
+        return rs, True
+    espere = "Si acaba de crearla o de arrancarla, espere medio minuto y repita."
+    if puerto == "rechazado":
+        rs.append(error("La máquina rechaza la conexión al puerto 22", fallo="D1",
+                        detalle=["ssh dice «Connection refused».", espere],
+                        efecto="la máquina tiene la IP, pero ssh todavía no escucha "
+                               "(o la máquina se ha quedado en modo de emergencia).",
+                        seccion="acceso"))
+    elif puerto == "sin ruta":
+        rs.append(error("No hay ruta hasta %s" % ip, fallo="D1",
+                        detalle=["ssh dice «No route to host».", espere],
+                        efecto="nada responde en esa IP: la máquina aún arranca, o "
+                               "network-config no le ha dado esa IP (B6).",
+                        seccion="acceso"))
+    else:
+        rs.append(error("La máquina no contesta en el puerto 22 de %s" % ip, fallo="D1",
+                        detalle=[espere], seccion="acceso"))
+    return rs, False
+
+
+def _ssh(ip, home, known_hosts, estricto):
+    opciones = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                "-o", "ConnectionAttempts=1", "-o", "NumberOfPasswordPrompts=0",
+                "-o", "UpdateHostKeys=no", "-o", "IdentitiesOnly=yes",
+                "-i", os.path.join(home, ".ssh", "id_rsa"),
+                "-o", "UserKnownHostsFile=%s" % known_hosts,
+                "-o", "StrictHostKeyChecking=%s" % ("yes" if estricto else "no")]
+    if not estricto:
+        opciones += ["-o", "GlobalKnownHostsFile=/dev/null"]
+    return ejecutar(["ssh", "-n"] + opciones + ["%s@%s" % (USUARIO_VM, ip), "true"],
+                    timeout=30)
+
+
+def comprobar_ssh(ip, home, cifrada, en_agente):
+    """D4 y D6: primero known_hosts, después el acceso. No escribe en known_hosts.
+
+    Devuelve (resultados, ha podido entrar).
+    """
+    rs = []
+    known_hosts = os.path.join(home, ".ssh", "known_hosts")
+    codigo, _, _ = ejecutar(["ssh-keygen", "-F", str(ip), "-f", known_hosts])
+    conocida = codigo == 0
+    codigo, _, err = _ssh(ip, home, known_hosts if conocida else "/dev/null", conocida)
+    if codigo == 0:
+        rs.append(ok("Puede entrar: ssh %s@%s funciona" % (USUARIO_VM, ip)))
+        return rs, True
+    if codigo is None:
+        rs.append(aviso("ssh no ha terminado a tiempo", seccion="acceso"))
+        return rs, False
+    if "REMOTE HOST IDENTIFICATION HAS CHANGED" in err:
+        rs.append(error(
+            "known_hosts tiene otra clave para %s" % ip, fallo="D4",
+            efecto="ssh se niega a conectar («REMOTE HOST IDENTIFICATION HAS CHANGED»). "
+                   "Pasa al volver a crear una máquina con la misma IP.",
+            arreglo='ssh-keygen -f "%s" -R "%s"' % (known_hosts, ip),
+            seccion="faq-warning"))
+        # Con la clave del host aparte, se mira si además entraría
+        codigo, _, err = _ssh(ip, home, "/dev/null", False)
+        if codigo == 0:
+            rs.append(ok("Quitando esa línea de known_hosts, podrá entrar"))
+            return rs, False
+    if "UNPROTECTED PRIVATE KEY FILE" in err:
+        rs.append(error("ssh ignora ~/.ssh/id_rsa por sus permisos", fallo="B10",
+                        arreglo="chmod 600 ~/.ssh/id_rsa", seccion="preliminar"))
+    elif "Permission denied" in err:
+        if cifrada and not en_agente:
+            rs.append(omitida(
+                "Acceso por ssh: no concluyente. Su clave tiene frase de paso y no está "
+                "en el agente, así que esta prueba no puede usarla (D6). Cárguela con "
+                "ssh-add y repita, o pruebe ssh %s@%s a mano" % (USUARIO_VM, ip)))
+        else:
+            rs.append(error(
+                "La máquina rechaza su clave: «Permission denied (publickey)»", fallo="B5",
+                efecto="lo que falla está en lo que cloud-init instaló en la máquina "
+                       "(usuario o clave).",
+                arreglo="apague la máquina (virsh shutdown) y vuelva a ejecutar "
+                        "ci-diagnosis: con la máquina apagada se revisa su disco.",
+                seccion="faq-publickey"))
+    else:
+        ultima = [l for l in err.strip().splitlines() if l.strip()][-1:] or ["(sin mensaje)"]
+        rs.append(error("ssh no ha podido entrar", detalle=["ssh dice: %s" % ultima[0]],
+                        seccion="acceso"))
+    return rs, False
+
+
+# --- C1: la orden de virt-install, en su registro --------------------------------
+
+REGISTRO_VIRT_INSTALL = os.path.join(".cache", "virt-manager", "virt-install.log")
+LANZADA_RE = re.compile(r"Launched with command line: (.*)$")
+
+
+def ultima_orden(home, nombre):
+    """La última orden de virt-install para esa máquina (lista de palabras)."""
+    base = os.path.join(home, REGISTRO_VIRT_INSTALL)
+    for ruta in [base] + ["%s.%d" % (base, i) for i in range(1, 6)]:
+        datos = leer_bytes(ruta)
+        if datos is None:
+            continue
+        encontrada = None
+        for linea in datos.decode("utf-8", "replace").splitlines():
+            m = LANZADA_RE.search(linea)
+            if m and nombre in _nombre_en(m.group(1).split()):
+                encontrada = m.group(1).split()
+        if encontrada:
+            return encontrada
+    return None
+
+
+def _nombre_en(palabras):
+    nombres = []
+    for i, p in enumerate(palabras):
+        if p.startswith("--name="):
+            nombres.append(p.split("=", 1)[1])
+        elif p in ("--name", "-n") and i + 1 < len(palabras):
+            nombres.append(palabras[i + 1])
+    return nombres
+
+
+def _valor(palabras, opcion):
+    for i, p in enumerate(palabras):
+        if p.startswith(opcion + "="):
+            return p.split("=", 1)[1]
+        if p == opcion and i + 1 < len(palabras):
+            return palabras[i + 1]
+    return None
+
+
+def comprobar_orden(home, uvus, nombre):
+    palabras = ultima_orden(home, nombre)
+    if palabras is None:
+        return [omitida("Orden de virt-install: no está en su registro "
+                        "(~/.cache/virt-manager/virt-install.log)")]
+    rs = []
+    sec = "instanciar"
+    un_guion = [p for p in palabras[1:] if re.match(r"^-[a-z]{2,}", p)]
+    if un_guion:
+        rs.append(error("La orden tiene opciones con un solo guion: %s" % " ".join(un_guion),
+                        fallo="C1", efecto="virt-install las entiende como otra cosa "
+                        "(-noautoconsole es --name oautoconsole).",
+                        arreglo="todas las opciones empiezan por dos guiones.", seccion=sec))
+    ci = _valor(palabras, "--cloud-init")
+    sueltas = [p for p in palabras if re.match(r"^(user-data|meta-data|network-config)=", p)
+               and p != ci]
+    if ci is None:
+        rs.append(error("La orden no lleva --cloud-init", fallo="C1",
+                        efecto="cloud-init no recibió ninguno de los tres archivos.",
+                        seccion=sec))
+    else:
+        faltan = [a for a in ARCHIVOS_CI if a + "=" not in ci]
+        if sueltas:
+            rs.append(error("Hay un espacio tras una coma en --cloud-init", fallo="C1",
+                            detalle=["Sueltos: %s" % " ".join(sueltas)],
+                            efecto="virt-install no los toma como parte de --cloud-init.",
+                            arreglo="los tres, separados por comas y sin espacios.",
+                            seccion=sec))
+        elif faltan:
+            rs.append(error("--cloud-init no lleva %s" % ", ".join(faltan), fallo="C1",
+                            efecto="cloud-init no recibió ese archivo.", seccion=sec))
+    if "--import" not in palabras:
+        rs.append(aviso("La orden no lleva --import", fallo="C1", seccion=sec))
+    if _valor(palabras, "--os-variant") is None and _valor(palabras, "--osinfo") is None:
+        rs.append(aviso("La orden no lleva --os-variant", fallo="C1", seccion=sec))
+    red = _valor(palabras, "--network")
+    if red is not None and "network=%s-red" % uvus not in red:
+        rs.append(aviso("La orden conecta la máquina a otra red: %s" % red, fallo="C1",
+                        seccion=sec))
+    if not rs:
+        rs.append(ok("La orden de virt-install es como la del manual"))
+    return rs
+
+
+# --- El disco de la máquina, con la máquina apagada (B4, B5, B6, D2) ------------
+#
+# Se lee con una sola sesión de guestfish en solo lectura (--ro): cada arranque
+# de libguestfs tarda de 8 a 15 s en los servidores. guestfish trabaja sobre una
+# copia temporal: el disco no se modifica.
+
+ARCHIVOS_DISCO = (
+    "/var/lib/cloud/data/result.json",
+    "/var/lib/cloud/data/status.json",
+    "/var/lib/cloud/instance/user-data.txt",
+    "/home/administrador/.ssh/authorized_keys",
+    "/etc/netplan/50-cloud-init.yaml",
+    "/var/log/cloud-init.log",
+)
+DIR_INSTANCIAS = "/var/lib/cloud/instances"
+MARCA = "==CI-DIAGNOSIS=="
+
+
+def comprobar_libguestfs():
+    """Lo que necesita libguestfs para funcionar con una cuenta normal."""
+    nucleo = "/boot/vmlinuz-%s" % os.uname().release
+    if os.path.exists(nucleo) and not os.access(nucleo, os.R_OK):
+        return error("No se puede leer el núcleo del servidor (%s)" % nucleo,
+                     efecto="no se puede revisar el disco de la máquina.",
+                     arreglo="avise al profesor: es un ajuste del servidor.",
+                     seccion="faq-guestfs")
+    if os.path.exists("/dev/kvm") and not os.access("/dev/kvm", os.R_OK | os.W_OK):
+        return aviso("No tiene acceso a /dev/kvm: revisar el disco será muy lento",
+                     arreglo="avise al profesor.")
+    return None
+
+
+def leer_disco(disco):
+    """Lee los archivos de ARCHIVOS_DISCO y la lista de instancias de cloud-init.
+
+    Devuelve (archivos, instancias, problema): archivos, {ruta: texto o None si no
+    existe}; instancias, lista de nombres o None; problema, un Resultado si no se
+    ha podido leer el disco.
+    """
+    ordenes = []
+    for ruta in ARCHIVOS_DISCO:
+        ordenes += ["echo %s %s" % (MARCA, ruta), "-is-file %s" % ruta, "-cat %s" % ruta]
+    ordenes += ["echo %s %s" % (MARCA, DIR_INSTANCIAS), "-is-dir %s" % DIR_INSTANCIAS,
+                "-ls %s" % DIR_INSTANCIAS]
+    codigo, salida, err = ejecutar(
+        ["guestfish", "--ro", "--format=qcow2", "-a", disco, "-i"],
+        timeout=300, entrada="\n".join(ordenes) + "\n")
+    if codigo is None:
+        return {}, None, error("guestfish no ha terminado a tiempo (o no está instalado)",
+                               arreglo="avise al profesor.", seccion="faq-guestfs")
+    if MARCA not in salida:
+        ultima = [l for l in err.strip().splitlines() if l.strip()][-1:] or ["(sin mensaje)"]
+        if "supermin" in err:
+            return {}, None, error("libguestfs no funciona en el servidor",
+                                   detalle=["guestfish dice: %s" % ultima[0]],
+                                   arreglo="avise al profesor.", seccion="faq-guestfs")
+        if "lock" in err:
+            return {}, None, error("El disco está en uso (¿la máquina sigue encendida?)",
+                                   detalle=["guestfish dice: %s" % ultima[0]],
+                                   seccion="acceso")
+        return {}, None, error("No se ha podido leer el disco",
+                               detalle=["guestfish dice: %s" % ultima[0]],
+                               arreglo="avise al profesor.", seccion="faq-guestfs")
+    archivos, instancias = {}, None
+    for trozo in salida.split(MARCA + " ")[1:]:
+        cabecera, _, resto = trozo.partition("\n")
+        ruta = cabecera.strip()
+        existe, _, contenido = resto.partition("\n")
+        if ruta == DIR_INSTANCIAS:
+            instancias = ([l for l in contenido.splitlines() if l.strip()]
+                          if existe.strip() == "true" else None)
+        else:
+            archivos[ruta] = contenido if existe.strip() == "true" else None
+    return archivos, instancias, None
+
+
+def _con_prefijo(resultados, prefijo):
+    """Los resultados de una comprobación, referidos a lo que hay en la máquina."""
+    for r in resultados:
+        texto = r.texto
+        if len(texto) > 1 and texto[0].isupper() and texto[1].islower():
+            texto = texto[0].lower() + texto[1:]
+        r.texto = prefijo + texto
+    return resultados
+
+
+def _json(texto):
+    try:
+        return json.loads(texto)
+    except (TypeError, ValueError):
+        return None
+
+
+def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, red):
+    """Lo que dejó cloud-init en la máquina."""
+    rs = []
+    sec = "acceso"
+
+    # ¿Se ejecutó cloud-init, y con qué?
+    if not instancias:
+        rs.append(error("cloud-init no llegó a configurar la máquina", fallo="C1",
+                        detalle=["No hay ninguna instancia en %s." % DIR_INSTANCIAS],
+                        efecto="la máquina no tiene ni el usuario ni la IP del manual.",
+                        arreglo="compruebe que pasó los tres archivos a virt-install.",
+                        seccion=sec))
+    elif len(instancias) > 1:
+        rs.append(aviso("El disco se ha configurado con %d instance-id distintos" % len(instancias),
+                        fallo="D2", detalle=["Instancias: %s." % ", ".join(instancias)],
+                        efecto="el disco se reutilizó con otro meta-data.",
+                        arreglo="para una máquina nueva, use siempre un disco nuevo.",
+                        seccion=sec))
+    else:
+        rs.append(ok("cloud-init configuró la máquina con el instance-id %s" % instancias[0]))
+
+    estado = _json(archivos.get("/var/lib/cloud/data/status.json"))
+    v1 = (estado or {}).get("v1") or {}
+    fuente = v1.get("datasource")
+    if estado is not None and not fuente:
+        rs.append(error("cloud-init no encontró los archivos de configuración", fallo="C1",
+                        efecto="la máquina arrancó sin user-data, meta-data ni network-config.",
+                        arreglo="compruebe la opción --cloud-init de virt-install.",
+                        seccion=sec))
+
+    resultado = _json(archivos.get("/var/lib/cloud/data/result.json"))
+    if resultado is not None:
+        errores = (resultado.get("v1") or {}).get("errors") or []
+        recuperables = (resultado.get("v1") or {}).get("recoverable_errors") or {}
+        if errores:
+            rs.append(error("cloud-init terminó con errores", fallo="B4",
+                            detalle=["cloud-init: %s" % str(e)[:200] for e in errores[:4]],
+                            seccion=sec))
+        avisos = [(nivel, m) for nivel, ms in recuperables.items() for m in ms]
+        if avisos:
+            rs.append(aviso("cloud-init dejó avisos", fallo="B4",
+                            detalle=["%s: %s" % (n, str(m)[:200]) for n, m in avisos[:4]],
+                            seccion=sec))
+        if not errores and not avisos:
+            rs.append(ok("cloud-init terminó sin errores ni avisos"))
+
+    # El user-data que se aplicó, frente al de ahora
+    aplicado = archivos.get("/var/lib/cloud/instance/user-data.txt")
+    if aplicado is not None:
+        if user_data_actual is not None and aplicado.strip() != user_data_actual.strip():
+            mismo_iid = instancias and iid_actual and iid_actual in instancias
+            rs.append(aviso(
+                "El user-data que se aplicó a la máquina no es el que tiene ahora en el silo",
+                fallo="D2" if mismo_iid else None,
+                efecto="cloud-init solo se aplica en el primer arranque: corregir "
+                       "user-data después no cambia la máquina." if mismo_iid else None,
+                arreglo="elimine la máquina y su disco, y créela de nuevo desde el "
+                        "primer paso de la 5.4.2." if mismo_iid else None,
+                seccion=sec))
+        problemas_ud = [r for r in comprobar_user_data(aplicado, clave)
+                        if r.estado in (ERROR, AVISO)]
+        rs += _con_prefijo(problemas_ud, "En el user-data que se aplicó, ")
+
+    # La clave que quedó en la máquina
+    claves_ruta = "/home/administrador/.ssh/authorized_keys"
+    if claves_ruta in archivos:
+        texto = archivos[claves_ruta]
+        if texto is None:
+            rs.append(error("En la máquina, administrador no tiene authorized_keys",
+                            fallo="B5", efecto="«Permission denied (publickey)».",
+                            arreglo="revise ssh_authorized_keys en user-data (o si se creó "
+                                    "el usuario administrador).", seccion=sec))
+        else:
+            instaladas = [c for c in (analizar_clave_publica(l) for l in texto.splitlines()
+                                      if l.strip() and not l.startswith("#")) if c]
+            if clave is None:
+                rs.append(omitida("Clave de la máquina: no hay ~/.ssh/id_rsa.pub con la que "
+                                  "compararla"))
+            elif any(c.blob == clave.blob for c in instaladas):
+                rs.append(ok("La máquina tiene su clave de ~/.ssh/id_rsa.pub"))
+            else:
+                rs.append(error(
+                    "La clave que tiene la máquina no es la de ~/.ssh/id_rsa.pub", fallo="B5",
+                    detalle=["En la máquina: %s" % c.describir() for c in instaladas]
+                    + ["id_rsa.pub:    %s" % clave.describir()],
+                    efecto="«Permission denied (publickey)».",
+                    arreglo="si regeneró la clave después de crear la máquina, vea la "
+                            "FAQ B.3; si no, corrija user-data y cree la máquina de nuevo.",
+                    seccion="faq-publickey"))
+
+    # La red que quedó en la máquina
+    netplan = archivos.get("/etc/netplan/50-cloud-init.yaml")
+    if netplan is not None and yaml is not None:
+        try:
+            datos = yaml.safe_load(netplan) or {}
+        except yaml.YAMLError:
+            datos = {}
+        red_maquina = datos.get("network") if isinstance(datos, dict) else None
+        if isinstance(red_maquina, dict):
+            r, _ = comprobar_network_config(yaml.safe_dump(red_maquina), red)
+            rs += _con_prefijo([x for x in r if x.estado in (ERROR, AVISO)],
+                               "En la red de la máquina, ")
+            if not any(x.estado in (ERROR, AVISO) for x in r):
+                rs.append(ok("La red de la máquina es la de network-config"))
+    elif "/etc/netplan/50-cloud-init.yaml" in archivos and netplan is None:
+        rs.append(error("La máquina no tiene la configuración de red de cloud-init",
+                        fallo="B6", efecto="no tiene la IP fija de network-config.",
+                        seccion=sec))
+    return rs
+
+
 # --- Programa principal --------------------------------------------------------
 
 USO = """\
@@ -1773,6 +2310,110 @@ def diagnosticar_antes(uvus, home, directorio, maquina, conn=None):
     return informe, maquina, existe
 
 
+def _meta_del_silo(directorio):
+    """(local-hostname, instance-id) de meta-data, o (None, None)."""
+    datos = leer_bytes(os.path.join(directorio, "meta-data"))
+    if datos is None or yaml is None:
+        return None, None
+    try:
+        meta = yaml.safe_load(datos.decode("utf-8", "replace").lstrip("\ufeff"))
+    except yaml.YAMLError:
+        return None, None
+    if not isinstance(meta, dict):
+        return None, None
+    host, iid = meta.get("local-hostname"), meta.get("instance-id")
+    return (str(host) if host else None), (str(iid) if iid else None)
+
+
+def _ip_de_network_config(directorio):
+    datos = leer_bytes(os.path.join(directorio, "network-config"))
+    if datos is None or yaml is None:
+        return None
+    try:
+        red = yaml.safe_load(datos.decode("utf-8", "replace"))
+        direccion = red["ethernets"][INTERFAZ]["addresses"][0]
+        return ipaddress.ip_interface(str(direccion)).ip
+    except Exception:
+        return None
+
+
+def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
+    """Revisión de una máquina ya creada en la que no se puede entrar."""
+    informe = Informe()
+    nombre = "%s-%s" % (uvus, maquina)
+    dominio = buscar_dominio(conn, nombre)
+    if dominio is None:
+        informe.bloque("Máquina", [error(
+            "No existe la máquina %s" % nombre,
+            arreglo="si todavía no la ha creado, revise antes su trabajo con "
+                    "ci-diagnosis --antes.", seccion="instanciar")])
+        return informe
+    m = Maquina(dominio)
+    informe.bloque("Máquina", comprobar_maquina(m, uvus))
+    res_claves, clave = comprobar_claves(home)
+    res_red, red = comprobar_red(conn, uvus)
+    problemas_red = [r for r in res_red if r.estado in (ERROR, AVISO)]
+    if problemas_red:
+        informe.bloque("Red", problemas_red)
+
+    # La IP: la indicada, la de network-config si es de esta máquina, o la de ARP
+    _, iid = _meta_del_silo(directorio)
+    ip, origen = ip_forzada, "--ip"
+    if ip is None and iid == nombre:
+        ip, origen = _ip_de_network_config(directorio), "network-config"
+    if ip is None and m.encendida:
+        ip, origen = ip_por_arp(dominio), "las tablas ARP del servidor"
+
+    entra = False
+    if m.encendida:
+        if ip is None:
+            informe.bloque("Conectividad", [omitida(
+                "No se sabe la IP de la máquina: el meta-data del silo es de otra máquina. "
+                "Indíquela con --ip")])
+        else:
+            res_con, abierto = comprobar_conectividad(ip)
+            informe.bloque("Conectividad", [ok("IP %s (de %s)" % (ip, origen))] + res_con)
+            if abierto:
+                cifrada, en_agente = estado_de_la_clave(home)
+                res_ssh, entra = comprobar_ssh(ip, home, cifrada, en_agente)
+                informe.bloque("Acceso por SSH", res_ssh)
+        if not entra:
+            informe.bloque("Disco de la máquina", [omitida(
+                "Para revisar su disco, apáguela (virsh shutdown %s), espere a que "
+                "virsh domstate %s diga «shut off» y vuelva a ejecutar ci-diagnosis"
+                % (nombre, nombre))])
+    elif m.apagada:
+        informe.bloque("Conectividad", [omitida("Conectividad y SSH: la máquina está apagada")])
+        informe.bloque("Disco de la máquina", revisar_disco(conn, m, clave, directorio,
+                                                            iid, red))
+    if not entra:
+        informe.bloque("Orden de virt-install", comprobar_orden(home, uvus, nombre))
+        res_archivos, _, _ = diagnosticar_archivos(uvus, directorio, maquina, clave, red)
+        informe.bloque("Archivos de cloud-init (en el silo)", res_archivos)
+    informe.bloque("Claves SSH", res_claves)
+    return informe
+
+
+def revisar_disco(conn, maquina, clave, directorio, iid, red):
+    if not maquina.discos:
+        return [error("La máquina no tiene ningún disco", seccion="instanciar")]
+    disco = maquina.discos[0]
+    for d in conn.listAllDomains(0):
+        if d.name() != maquina.nombre and d.isActive() and disco in discos_de(d):
+            return [error("El disco lo está usando la máquina encendida %s" % d.name(),
+                          fallo="C2", seccion="instanciar")]
+    previo = comprobar_libguestfs()
+    if previo is not None and previo.estado == ERROR:
+        return [previo]
+    archivos, instancias, problema = leer_disco(disco)
+    if problema is not None:
+        return [problema]
+    actual = leer_bytes(os.path.join(directorio, "user-data"))
+    actual = actual.decode("utf-8", "replace") if actual is not None else None
+    rs = [ok("Disco leído: %s" % disco)] + ([previo] if previo else [])
+    return rs + comprobar_disco(archivos, instancias, clave, actual, iid, red)
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     for flujo in (sys.stdout, sys.stderr):
@@ -1792,10 +2433,6 @@ def main(argv=None):
     if opciones["version"]:
         print("ci-diagnosis %s" % VERSION)
         return 0
-    if opciones["modo"] == "acceso":
-        print("ci-diagnosis: --acceso todavía no está disponible.", file=sys.stderr)
-        return 2
-
     # El usuario de la cuenta, no el de las variables de entorno. Para las
     # pruebas locales se puede fijar con CI_DIAGNOSIS_USUARIO.
     uvus = (os.environ.get("CI_DIAGNOSIS_USUARIO")
@@ -1811,7 +2448,22 @@ def main(argv=None):
               file=sys.stderr)
         return 2
     try:
-        informe, maquina, existe = diagnosticar_antes(uvus, home, directorio, maquina, conn)
+        if maquina is None:
+            maquina = normalizar_maquina(_meta_del_silo(directorio)[0], uvus)
+        modo = opciones["modo"]
+        if modo is None:
+            existe = maquina is not None and buscar_dominio(
+                conn, "%s-%s" % (uvus, maquina)) is not None
+            modo = "acceso" if existe else "antes"
+        if modo == "acceso":
+            if maquina is None:
+                print("ci-diagnosis: indique qué máquina quiere revisar "
+                      "(por ejemplo: ci-diagnosis server1 --acceso).", file=sys.stderr)
+                return 2
+            informe = diagnosticar_acceso(uvus, home, directorio, maquina, conn,
+                                          opciones["ip"])
+        else:
+            informe, maquina, _ = diagnosticar_antes(uvus, home, directorio, maquina, conn)
     finally:
         try:
             conn.close()
@@ -1821,10 +2473,12 @@ def main(argv=None):
     servidor = os.uname().nodename.split(".")[0]
     print("ci-diagnosis %s · %s · usuario: %s · máquina: %s" % (
         VERSION, servidor, uvus, "%s-%s" % (uvus, maquina) if maquina else "sin determinar"))
-    print("Modo: antes de virt-install")
-    if existe and opciones["modo"] is None:
-        print("(La máquina ya existe. La revisión --acceso, para cuando no puede "
-              "entrar en ella, todavía no está disponible.)")
+    if modo == "acceso":
+        print("Modo: no puede entrar en la máquina (--acceso)")
+        if opciones["modo"] is None:
+            print("(La máquina ya existe. Para revisarla como antes de crearla: --antes)")
+    else:
+        print("Modo: antes de virt-install (--antes)")
     print("(Versión en desarrollo.)")
     print()
     for linea in formatear_informe(informe, usar_color(sys.stdout)):

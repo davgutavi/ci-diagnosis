@@ -10,6 +10,11 @@
 #   a   Revisión --antes: provoca cada fallo en el silo de la cuenta de prueba
 #       (archivos, claves, disco, permisos) y comprueba que ci-diagnosis lo
 #       detecta. No crea máquinas, silos ni redes.
+#   b   Revisión --acceso: crea la máquina <usuario>-server1 (IP .2 de su red),
+#       una cada vez, con cada fallo; graba lo que pasa (mensajes de ssh en los
+#       primeros segundos, virt-install) y comprueba que ci-diagnosis lo detecta,
+#       con la máquina encendida y, apagada, leyendo su disco. Tarda de 10 a 15
+#       minutos. Al terminar elimina la máquina y su disco.
 #
 # Variables:
 #   CI_DIAGNOSIS=RUTA   el programa que se prueba (por defecto, ci-diagnosis en
@@ -28,6 +33,7 @@ export LC_ALL=C
 # prueba sí lo tiene (su máscara sería 002), así que se fija la de los alumnos
 umask 022
 URI="qemu:///system"
+export LIBVIRT_DEFAULT_URI="$URI"
 AQUI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CI="${CI_DIAGNOSIS:-$AQUI/ci-diagnosis}"
 PY=/usr/bin/python3
@@ -65,6 +71,7 @@ MODO_HOME="$(stat -c %a "$HOME")"
 AGENTE_PID=""
 
 limpiar() {
+    eliminar_vm 2>/dev/null
     chmod "$MODO_HOME" "$HOME"
     [[ -f "$T/$BASE" && ! -f "$SILO/$BASE" ]] && mv "$T/$BASE" "$SILO/$BASE"
     [[ -n "$AGENTE_PID" ]] && kill "$AGENTE_PID" 2>/dev/null
@@ -363,9 +370,249 @@ FIN
     fi
 }
 
+# ---------------------------------------------------------------------------
+# Fase B: revisión --acceso, con máquinas de verdad
+# ---------------------------------------------------------------------------
+VM="$USUARIO-server1"
+IP_VM="192.168.$XXX.2"
+CI_SPEC="user-data=user-data,meta-data=meta-data,network-config=network-config"
+
+eliminar_vm() {
+    if virsh -q dominfo "$VM" >/dev/null 2>&1; then
+        virsh -q destroy "$VM" >/dev/null 2>&1
+        virsh -q undefine "$VM" >/dev/null 2>&1
+    fi
+    rm -f "$SILO/server1.qcow2"
+}
+
+# crear_vm [ESPECIFICACIÓN DE --cloud-init]: la orden del manual (5.4.2), desde el silo
+crear_vm() {
+    local spec="${1:-$CI_SPEC}" salida rc
+    salida="$(cd "$SILO" && virt-install --name="$VM" --cloud-init "$spec" --ram=2048 \
+        --vcpus=2 --import --disk path=server1.qcow2 --os-variant=ubuntu24.04 \
+        --network network="$USUARIO-red" --noautoconsole 2>&1)"; rc=$?
+    printf '\n$ virt-install --cloud-init %s   → código %s\n%s\n' "$spec" "$rc" "$salida" >> "$LOG"
+    return $rc
+}
+
+apagar_vm() {
+    local i
+    virsh -q shutdown "$VM" >/dev/null 2>&1
+    for i in $(seq 60); do
+        [[ "$(virsh -q domstate "$VM" 2>/dev/null)" == "shut off" ]] && return 0
+        sleep 2
+    done
+    info "no se apagó en 2 minutos: virsh destroy"
+    virsh -q destroy "$VM" >/dev/null 2>&1
+}
+
+# esperar_ssh CLAVE SEGUNDOS: prueba ssh cada 3 s y escribe cada mensaje nuevo
+# con los segundos transcurridos (los de los primeros segundos son D1). Termina
+# al entrar (0) o con «Permission denied», que ya no va a cambiar (1).
+esperar_ssh() {
+    local clave="$1" maximo="$2" inicio ahora err ultimo=""
+    inicio=$(date +%s)
+    while :; do
+        ahora=$(( $(date +%s) - inicio ))
+        if err="$(ssh -n -i "$clave" -o IdentitiesOnly=yes -o IdentityAgent=none \
+                  -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no \
+                  -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+                  "administrador@$IP_VM" true 2>&1)"; then
+            info "$ahora s: entra"
+            echo "[$ahora s] entra" >> "$LOG"
+            return 0
+        fi
+        err="$(tail -1 <<< "$err")"
+        if [[ "$err" != "$ultimo" ]]; then
+            info "$ahora s: $err"
+            echo "[$ahora s] $err" >> "$LOG"
+            ultimo="$err"
+        fi
+        [[ "$err" == *"Permission denied"* ]] && return 1
+        (( ahora >= maximo )) && return 1
+        sleep 3
+    done
+}
+
+# Margen para que cloud-init termine antes de apagar la máquina: si no, su
+# disco podría quedar a medias (sin result.json, sin la clave...)
+esperar_cloud_init() {
+    sleep 45
+}
+
+# esperar_puerto SEGUNDOS: hasta que el puerto 22 de la máquina acepta conexiones
+esperar_puerto() {
+    local i
+    for i in $(seq "$(( $1 / 3 ))"); do
+        timeout 3 bash -c "</dev/tcp/$IP_VM/22" 2>/dev/null && return 0
+        sleep 3
+    done
+    return 1
+}
+
+# diag DESCRIPCION PATRON [ARGS...]: ci-diagnosis server1 desde el silo
+diag() {
+    local desc="$1" patron="$2"; shift 2
+    ejecuta "$SILO" server1 "$@"
+    espera "$desc" "$patron"
+}
+
+# Lectura del disco, cronometrada
+diag_disco() {
+    local desc="$1" patron="$2" inicio
+    inicio=$(date +%s)
+    ejecuta "$SILO" server1
+    info "revisión con lectura del disco: $(( $(date +%s) - inicio )) s"
+    espera "$desc" "$patron"
+}
+
+fase_b() {
+    virsh -q dominfo "$VM" >/dev/null 2>&1 && {
+        echo "Ya existe la máquina $VM: elimínala antes (virsh destroy y undefine)." >&2
+        exit 1; }
+
+    titulo "B.0 Máquina como dice el manual"
+    preparar_bien
+    if crear_vm; then ok "virt-install la crea"; else ko "virt-install falla (ver el registro)"; fi
+    info "ssh desde el primer segundo (D1):"
+    if esperar_ssh "$HOME/.ssh/id_rsa" 180; then ok "se puede entrar"; else ko "no se puede entrar"; fi
+    esperar_cloud_init
+    diag "con la máquina encendida: «Puede entrar»" 'Puede entrar'
+    espera "...y avisa de la configuración del primer arranque (D3)" 'primer arranque \[D3\]'
+    [[ "$RC" == 0 ]] && ok "código de salida 0" || ko "código de salida $RC, esperaba 0"
+    # D5: con esta encendida, otra máquina con la misma IP
+    meta_data | sed 's/server1/server2/' > "$SILO/meta-data"
+    ejecuta "$SILO" server2 --antes
+    espera "otra máquina con la misma IP (D5)" "Algo responde ya en la IP $IP_VM"
+    meta_data > "$SILO/meta-data"
+    # La clave del host queda en known_hosts, para la prueba de D4
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new "administrador@$IP_VM" true \
+        >>"$LOG" 2>&1
+    apagar_vm
+    diag_disco "apagada: lee el disco con libguestfs" 'Disco leído'
+    espera "...y la clave de la máquina es la suya" 'La máquina tiene su clave'
+    espera "...y cloud-init no dejó errores" 'cloud-init terminó sin errores'
+
+    titulo "B.1 Misma IP, máquina nueva: known_hosts (D4)"
+    eliminar_vm
+    preparar_bien
+    crear_vm
+    esperar_ssh "$HOME/.ssh/id_rsa" 180 >/dev/null
+    esperar_cloud_init
+    diag "detecta la clave del host cambiada" 'known_hosts tiene otra clave .*\[D4\]'
+    espera "...y que, quitándola, entraría" 'podrá entrar'
+    ssh-keygen -R "$IP_VM" >>"$LOG" 2>&1
+    eliminar_vm
+
+    titulo "B.2 Clave del portátil en user-data (B5)"
+    preparar_bien
+    user_data "$(cat "$T/portatil.pub")" > "$SILO/user-data"
+    crear_vm
+    info "ssh (mensaje real):"
+    esperar_ssh "$HOME/.ssh/id_rsa" 180
+    esperar_cloud_init
+    diag "encendida: la máquina rechaza la clave" 'rechaza su clave'
+    espera "...y pide apagarla para revisar el disco" "virsh shutdown $VM"
+    apagar_vm
+    diag_disco "apagada: la clave de la máquina no es la de id_rsa.pub" \
+        'La clave que tiene la máquina no es la de'
+    eliminar_vm
+
+    titulo "B.3 user-data sin #cloud-config (B4)"
+    preparar_bien
+    sed -i '1d' "$SILO/user-data"
+    crear_vm
+    info "ssh (mensaje real):"
+    esperar_ssh "$HOME/.ssh/id_rsa" 180
+    esperar_cloud_init
+    apagar_vm
+    diag_disco "apagada: administrador no tiene authorized_keys" 'no tiene authorized_keys'
+    espera "...y el user-data aplicado no tenía #cloud-config" \
+        'En el user-data que se aplicó, la primera línea'
+    eliminar_vm
+
+    titulo "B.4 network-config con eth0 (B6)"
+    preparar_bien
+    network_config "" "" eth0 > "$SILO/network-config"
+    crear_vm
+    info "ssh (mensaje real):"
+    esperar_ssh "$HOME/.ssh/id_rsa" 120
+    diag "encendida: no hay ruta hasta la IP" "No hay ruta hasta $IP_VM|no contesta en el puerto 22"
+    apagar_vm
+    diag_disco "apagada: la red de la máquina no es la del manual" 'En la red de la máquina, '
+    eliminar_vm
+
+    titulo "B.5 --cloud-init sin network-config (C1)"
+    preparar_bien
+    crear_vm "user-data=user-data,meta-data=meta-data"
+    info "ssh (mensaje real):"
+    esperar_ssh "$HOME/.ssh/id_rsa" 120
+    diag "la orden no llevaba network-config" '--cloud-init no lleva network-config'
+    eliminar_vm
+
+    titulo "B.6 Espacio tras la coma en --cloud-init (C1, mensaje real)"
+    preparar_bien
+    salida="$(cd "$SILO" && virt-install --name="$VM" --cloud-init user-data=user-data, \
+        meta-data=meta-data,network-config=network-config --ram=2048 --vcpus=2 --import \
+        --disk path=server1.qcow2 --os-variant=ubuntu24.04 --network network="$USUARIO-red" \
+        --noautoconsole 2>&1)"; rc=$?
+    printf '%s\n[código %s]\n' "$salida" "$rc" | tee -a "$LOG" | sed 's/^/       | /'
+    if virsh -q dominfo "$VM" >/dev/null 2>&1; then
+        info "virt-install creó la máquina"
+        diag "la orden tenía un espacio tras la coma" 'espacio tras una coma'
+    else
+        info "virt-install no creó la máquina"
+    fi
+    eliminar_vm
+
+    titulo "B.7 user-data corregido con el disco ya usado (D2)"
+    preparar_bien
+    user_data "$(cat "$T/portatil.pub")" > "$SILO/user-data"
+    crear_vm
+    esperar_ssh "$HOME/.ssh/id_rsa" 180 >/dev/null
+    esperar_cloud_init
+    apagar_vm
+    virsh -q undefine "$VM" >/dev/null 2>&1
+    user_data > "$SILO/user-data"      # el alumno corrige user-data...
+    crear_vm                            # ...y crea la máquina con el mismo disco
+    info "ssh tras corregir user-data (mensaje real):"
+    esperar_ssh "$HOME/.ssh/id_rsa" 180
+    esperar_cloud_init
+    apagar_vm
+    diag_disco "apagada: el user-data aplicado no es el de ahora (D2)" \
+        'no es el que tiene ahora en el silo \[D2\]'
+    eliminar_vm
+
+    titulo "B.8 Frase de paso, sin y con agente (D6), con un HOME aparte"
+    local h="$T/home"
+    mkdir -p -m 700 "$h/.ssh"
+    clave "$h/.ssh/id_rsa" "$USUARIO@servidor" "frase de prueba"
+    preparar_bien
+    user_data "$(cat "$h/.ssh/id_rsa.pub")" > "$SILO/user-data"
+    crear_vm
+    printf '#!/bin/sh\necho "frase de prueba"\n' > "$T/askpass"
+    chmod 700 "$T/askpass"
+    eval "$(ssh-agent -s)" >/dev/null
+    AGENTE_PID="$SSH_AGENT_PID"
+    SSH_ASKPASS="$T/askpass" SSH_ASKPASS_REQUIRE=force DISPLAY=x \
+        ssh-add "$h/.ssh/id_rsa" </dev/null >>"$LOG" 2>&1
+    esperar_puerto 180 || ko "el puerto 22 no se abre"
+    esperar_cloud_init
+    SALIDA="$(cd "$SILO" && HOME="$h" SSH_AUTH_SOCK= "$PY" "$CI" server1 2>&1)"
+    printf '\n$ HOME=%s ci-diagnosis (con frase, sin agente)\n%s\n' "$h" "$SALIDA" >> "$LOG"
+    espera "sin agente: no concluyente, sin dar error de clave" 'no concluyente'
+    no_aparece "...y no dice que la máquina rechace la clave" 'rechaza su clave'
+    SALIDA="$(cd "$SILO" && HOME="$h" "$PY" "$CI" server1 2>&1)"
+    printf '\n$ HOME=%s ci-diagnosis (con frase, en el agente)\n%s\n' "$h" "$SALIDA" >> "$LOG"
+    espera "con la clave en el agente: «Puede entrar»" 'Puede entrar'
+    kill "$AGENTE_PID" 2>/dev/null; AGENTE_PID=""
+    eliminar_vm
+}
+
 case "$FASE" in
     a) fase_a ;;
-    *) echo "Fase desconocida: $FASE (de momento, solo a)" >&2; exit 2 ;;
+    b) fase_b ;;
+    *) echo "Fase desconocida: $FASE (a o b)" >&2; exit 2 ;;
 esac
 
 echo

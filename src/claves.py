@@ -228,6 +228,25 @@ def _listar(directorio):
         return []
 
 
+def estado_de_la_clave(home):
+    """(cifrada, en el agente) de ~/.ssh/id_rsa, para interpretar ssh (D6)."""
+    datos = leer_bytes(os.path.join(home, ".ssh", "id_rsa"))
+    if datos is None:
+        return None, False
+    _, cifrada, publica = analizar_privada(datos)
+    del datos
+    if publica is None:
+        pub = leer_bytes(os.path.join(home, ".ssh", "id_rsa.pub"))
+        publica = analizar_clave_publica(pub.decode("utf-8", "replace")) if pub else None
+    if not os.environ.get("SSH_AUTH_SOCK") or publica is None:
+        return cifrada, False
+    codigo, salida, _ = ejecutar(["ssh-add", "-L"], timeout=10)
+    if codigo != 0:
+        return cifrada, False
+    cargadas = [analizar_clave_publica(l) for l in salida.splitlines()]
+    return cifrada, any(c and c.blob == publica.blob for c in cargadas)
+
+
 def comprobar_agente(clave):
     """D6: con frase de paso, la clave debería estar cargada en el agente."""
     arreglo_agente = ("cárguela con «ssh-add» (si no funciona, antes "

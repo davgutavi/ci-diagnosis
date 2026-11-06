@@ -15,6 +15,10 @@ src/claves.py     ~/.ssh/id_rsa e id_rsa.pub, agente (B7, B10, D6)
 src/archivos.py   user-data, meta-data y network-config (B1, B4, B5, B6)
 src/servidor.py   libvirt (solo lectura): silos, red, imagen y disco, nombres y
                   permisos (A1, A2, A3, B2, B3, B8, B9, C1, C2, D5)
+src/acceso.py     --acceso: estado de la máquina, conectividad, SSH y la orden
+                  de virt-install en su registro (C1, D1, D3, D4, D6)
+src/disco.py      --acceso con la máquina apagada: su disco, con guestfish --ro
+                  (B4, B5, B6, D2)
 src/main.py       Opciones y flujo principal
 ```
 
@@ -78,6 +82,11 @@ tienen que probarse como los verá un alumno.
   detecta y graba los mensajes reales (`qemu-img` sin `-F`, PyYAML,
   `cloud-init schema`). No crea máquinas, silos ni redes, y deja el silo como
   estaba.
+- **Fase b:** revisión `--acceso`. Crea `<usuario>-server1` (IP `.2` de su red),
+  una cada vez, con cada fallo (B4, B5, B6, C1, D2, D3, D4, D5, D6); graba los
+  mensajes de `ssh` desde el primer segundo (D1) y comprueba `ci-diagnosis` con
+  la máquina encendida y, apagada, leyendo su disco. Tarda de 10 a 15 minutos y
+  elimina la máquina y su disco al terminar.
 
 El registro completo queda en `/tmp/pruebas-ci-diagnosis-<usuario>-<fecha>.log`.
 
@@ -102,6 +111,13 @@ la cuenta de prueba está activo y haría fallar `virt-install` a todos (A1).
 - **Mensajes del sistema.** Los que se citan en los textos tienen que estar
   grabados en el servidor (por ejemplo, `Permission denied (publickey)`). Si
   no lo están, se describe el efecto sin citar.
+- **Nunca apaga ni arranca máquinas.** Si para leer el disco hace falta
+  apagarla, se le pide al alumno. El disco se lee con `guestfish --ro` en una
+  sola sesión (cada arranque de libguestfs tarda de 8 a 15 s en los servidores).
+- **ssh, sin falsos negativos.** `BatchMode=yes` no puede pedir la frase de
+  paso: si la clave la tiene y no está en el agente, el resultado es «no
+  concluyente», no un error. Y nunca escribe en `known_hosts`: con una entrada
+  para la IP se prueba en modo estricto (D4); sin ella, con `/dev/null`.
 - **Silos por trayecto.** Los nombres de los silos no identifican al dueño
   (hay erratas y variantes): todo se decide por el trayecto real (`realpath`).
 - **Permisos, no dueños.** libvirt cambia el dueño de la imagen base y del disco
