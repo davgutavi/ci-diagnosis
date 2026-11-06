@@ -1,0 +1,1216 @@
+#!/usr/bin/python3
+"""ci-diagnosis: diagnóstico de máquinas virtuales construidas con cloud-init.
+
+Asignatura Sistemas Operativos, Universidad de Sevilla.
+https://github.com/davgutavi/ci-diagnosis
+
+Este archivo se genera con tools/build.py a partir de src/: no lo edite a mano.
+
+La herramienta solo lee: no cambia archivos, no arranca ni apaga máquinas, no
+toca silos ni redes y no muestra nunca la clave privada.
+"""
+
+import base64
+import hashlib
+import ipaddress
+import os
+import pwd
+import re
+import stat
+import struct
+import subprocess
+import sys
+import textwrap
+import unicodedata
+
+try:
+    import yaml
+except ImportError:  # sin PyYAML se omiten las comprobaciones de estructura
+    yaml = None
+
+VERSION = "0.1.0-dev"
+
+# Si José Antonio decide que la herramienta solo señale los fallos, basta con
+# poner esto a False: «Cómo arreglarlo» desaparece de toda la salida.
+MOSTRAR_ARREGLO = True
+
+OK = "OK"
+AVISO = "AVISO"
+ERROR = "ERROR"
+OMITIDA = "--"
+
+
+class Resultado:
+    """El resultado de una comprobación.
+
+    estado   OK, AVISO, ERROR u OMITIDA (no comprobada: falla algo de lo que depende)
+    texto    una línea con lo comprobado o lo que falla
+    fallo    código del catálogo (B5, D6...), si lo hay
+    detalle  líneas con datos concretos (números de línea, huellas...)
+    efecto   qué pasará si no se arregla
+    arreglo  cómo arreglarlo
+    seccion  clave de SECCIONES (textos.py)
+    """
+
+    def __init__(self, estado, texto, fallo=None, detalle=(), efecto=None,
+                 arreglo=None, seccion=None):
+        self.estado = estado
+        self.texto = texto
+        self.fallo = fallo
+        self.detalle = list(detalle)
+        self.efecto = efecto
+        self.arreglo = arreglo
+        self.seccion = seccion
+
+    def __repr__(self):
+        return "Resultado(%s, %r, %s)" % (self.estado, self.texto, self.fallo)
+
+
+def ok(texto, **kw):
+    return Resultado(OK, texto, **kw)
+
+
+def aviso(texto, **kw):
+    return Resultado(AVISO, texto, **kw)
+
+
+def error(texto, **kw):
+    return Resultado(ERROR, texto, **kw)
+
+
+def omitida(texto, **kw):
+    return Resultado(OMITIDA, texto, **kw)
+
+
+class Informe:
+    """Resultados agrupados por bloques, en el orden en que se comprueban."""
+
+    def __init__(self):
+        self.bloques = []
+
+    def bloque(self, titulo, resultados):
+        self.bloques.append((titulo, list(resultados)))
+
+    def todos(self):
+        return [r for _, rs in self.bloques for r in rs]
+
+    def cuenta(self, estado):
+        return sum(1 for r in self.todos() if r.estado == estado)
+
+    def codigo_salida(self):
+        return 1 if self.cuenta(ERROR) else 0
+
+
+# --- Salida ---------------------------------------------------------------
+
+ANCHO = 78
+SANGRIA = " " * 9
+COLORES = {OK: "\033[32m", AVISO: "\033[33m", ERROR: "\033[31m", OMITIDA: "\033[2m"}
+FIN_COLOR = "\033[0m"
+
+
+def _envolver(texto, primera, resto):
+    return textwrap.wrap(texto, ANCHO, initial_indent=primera,
+                         subsequent_indent=resto, break_on_hyphens=False,
+                         break_long_words=False) or [primera.rstrip()]
+
+
+def formatear_resultado(r, color=False):
+    etiqueta = r.estado.ljust(7)
+    if color:
+        etiqueta = COLORES[r.estado] + r.estado + FIN_COLOR + " " * (7 - len(r.estado))
+    texto = r.texto + (" [%s]" % r.fallo if r.fallo else "")
+    lineas = _envolver(texto, "  " + "X" * 7, SANGRIA)
+    lineas[0] = "  " + etiqueta + lineas[0][9:]
+    if r.estado in (OK, OMITIDA):
+        return lineas
+    for d in r.detalle:
+        lineas += _envolver(d, SANGRIA, SANGRIA + "  ")
+    if r.efecto:
+        lineas += _envolver("Efecto: " + r.efecto, SANGRIA, SANGRIA)
+    if r.arreglo and MOSTRAR_ARREGLO:
+        lineas += _envolver("Cómo arreglarlo: " + r.arreglo, SANGRIA, SANGRIA)
+    if r.seccion:
+        lineas += _envolver("Manual: " + SECCIONES[r.seccion], SANGRIA, SANGRIA)
+    return lineas
+
+
+def formatear_informe(informe, color=False):
+    lineas = []
+    for titulo, resultados in informe.bloques:
+        lineas.append(titulo.upper())
+        for r in resultados:
+            lineas += formatear_resultado(r, color)
+        lineas.append("")
+    errores, avisos = informe.cuenta(ERROR), informe.cuenta(AVISO)
+    if errores:
+        lineas.append("Resultado: %d ERROR, %d AVISO. Empiece por el primer ERROR: "
+                      "los demás pueden ser consecuencia suya." % (errores, avisos))
+    elif avisos:
+        lineas.append("Resultado: ningún ERROR y %d AVISO. Revise los avisos." % avisos)
+    else:
+        lineas.append("Resultado: todo correcto.")
+    return lineas
+
+
+def usar_color(flujo):
+    return flujo.isatty() and "NO_COLOR" not in os.environ
+
+
+# --- Órdenes externas -------------------------------------------------------
+
+# Solo estas, y todas solo para leer. Cualquier otra es un error de programación.
+ORDENES_PERMITIDAS = ("qemu-img", "ssh-keygen", "ssh", "ssh-add", "ping",
+                      "guestfish", "virt-cat", "virt-ls")
+
+
+def ejecutar(argv, timeout=30):
+    """Ejecuta una orden de la lista blanca, sin teclado y con LC_ALL=C.
+
+    Devuelve (código, salida, errores). El código es None si la orden no existe
+    o no termina a tiempo.
+    """
+    if argv[0] not in ORDENES_PERMITIDAS:
+        raise ValueError("orden no permitida: %s" % argv[0])
+    entorno = dict(os.environ, LC_ALL="C", LANG="C")
+    try:
+        p = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, env=entorno, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, "", ""
+    return (p.returncode, p.stdout.decode("utf-8", "replace"),
+            p.stderr.decode("utf-8", "replace"))
+
+
+def leer_bytes(ruta):
+    """Contenido de un archivo, o None si no existe o no se puede leer."""
+    try:
+        with open(ruta, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+# --- Secciones del manual ----------------------------------------------------
+#
+# Todas las referencias al manual están aquí: si el manual cambia la numeración,
+# se cambia solo esta tabla. Numeración del manual v4.2.0.
+
+SECCIONES = {
+    "silo": "sección 5.2 (Silo)",
+    "red": "sección 5.3 (Red virtual)",
+    "preliminar": "sección 5.4.1 (Pasos preliminares)",
+    "instanciar": "sección 5.4.2 (Instanciar la máquina virtual)",
+    "acceso": "sección 5.4.3 (Primer acceso)",
+    "faq-warning": "FAQ B.2 (remote host identification has changed)",
+    "faq-publickey": "FAQ B.3 (Permission denied (publickey))",
+    "faq-guestfs": "FAQ B.5 (libguestfs error)",
+}
+
+# Lo que espera el manual
+USUARIO_VM = "administrador"
+SUDO_ESPERADO = "ALL=(ALL) NOPASSWD:ALL"
+INTERFAZ = "enp1s0"
+DNS_ESPERADOS = ("150.214.186.69", "150.214.130.15")
+ARCHIVOS_CI = ("user-data", "meta-data", "network-config")
+
+
+# --- Claves SSH (B5, B7, B10, D6) -------------------------------------------
+#
+# Nunca se muestra ni se guarda nada de la clave privada: de ella solo se lee la
+# cabecera, que en el formato openssh-key-v1 dice, sin cifrar, si tiene frase
+# de paso y cuál es su clave pública.
+
+class ClavePublica:
+    def __init__(self, tipo, blob, comentario=""):
+        self.tipo = tipo
+        self.blob = blob
+        self.comentario = comentario
+
+    @property
+    def huella(self):
+        resumen = base64.b64encode(hashlib.sha256(self.blob).digest()).decode()
+        return "SHA256:" + resumen.rstrip("=")
+
+    def describir(self):
+        if self.comentario:
+            return "%s (%s)" % (self.huella, self.comentario)
+        return self.huella
+
+
+def _cadenas_ssh(blob):
+    """Divide un blob SSH en sus cadenas (uint32 de longitud + datos), o None
+    si no está completo: así se detecta una clave cortada."""
+    cadenas, i = [], 0
+    while i < len(blob):
+        if i + 4 > len(blob):
+            return None
+        n = struct.unpack(">I", blob[i:i + 4])[0]
+        if i + 4 + n > len(blob):
+            return None
+        cadenas.append(blob[i + 4:i + 4 + n])
+        i += 4 + n
+    return cadenas
+
+
+# Número de cadenas del blob público de cada tipo
+CAMPOS_POR_TIPO = {"ssh-rsa": 3, "ssh-ed25519": 2, "ssh-dss": 5,
+                   "ecdsa-sha2-nistp256": 3, "ecdsa-sha2-nistp384": 3,
+                   "ecdsa-sha2-nistp521": 3}
+
+
+def clave_desde_blob(blob, comentario=""):
+    cadenas = _cadenas_ssh(blob)
+    if not cadenas:
+        return None
+    try:
+        tipo = cadenas[0].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if tipo in CAMPOS_POR_TIPO and len(cadenas) != CAMPOS_POR_TIPO[tipo]:
+        return None
+    return ClavePublica(tipo, blob, comentario)
+
+
+def analizar_clave_publica(texto):
+    """'ssh-rsa AAAA... comentario' → ClavePublica, o None si no es válida."""
+    partes = texto.strip().split(None, 2)
+    if len(partes) < 2:
+        return None
+    try:
+        blob = base64.b64decode(partes[1], validate=True)
+    except (ValueError, TypeError):
+        return None
+    clave = clave_desde_blob(blob, partes[2] if len(partes) > 2 else "")
+    if clave is None or clave.tipo != partes[0]:
+        return None
+    return clave
+
+
+PRIVADA_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+
+
+def analizar_privada(datos):
+    """Cabecera de una clave privada.
+
+    Devuelve (formato, cifrada, publica): formato 'openssh', 'pem' o None (no
+    se reconoce); cifrada True/False/None (no se sabe); publica, la ClavePublica
+    que contiene (solo en el formato openssh).
+    """
+    texto = datos.decode("ascii", "replace")
+    if "-----BEGIN OPENSSH PRIVATE KEY-----" in texto:
+        cuerpo = texto.split("-----BEGIN OPENSSH PRIVATE KEY-----", 1)[1]
+        cuerpo = cuerpo.split("-----END OPENSSH PRIVATE KEY-----", 1)[0]
+        try:
+            blob = base64.b64decode("".join(cuerpo.split()))
+        except (ValueError, TypeError):
+            return "openssh", None, None
+        magia = b"openssh-key-v1\0"
+        if not blob.startswith(magia):
+            return "openssh", None, None
+        resto = blob[len(magia):]
+        # cifrado, kdf, opciones del kdf, número de claves y la primera pública
+        campos, i = [], 0
+        try:
+            for _ in range(3):
+                n = struct.unpack(">I", resto[i:i + 4])[0]
+                campos.append(resto[i + 4:i + 4 + n])
+                i += 4 + n
+            i += 4
+            n = struct.unpack(">I", resto[i:i + 4])[0]
+            publica = clave_desde_blob(resto[i + 4:i + 4 + n])
+        except struct.error:
+            return "openssh", None, None
+        return "openssh", campos[0] != b"none", publica
+    if PRIVADA_RE.search(texto):
+        cifrada = ("Proc-Type: 4,ENCRYPTED" in texto
+                   or "BEGIN ENCRYPTED PRIVATE KEY" in texto)
+        return "pem", cifrada, None
+    return None, None, None
+
+
+def _modo(st):
+    return "%04o" % stat.S_IMODE(st.st_mode)
+
+
+def comprobar_claves(home):
+    """Comprobaciones de ~/.ssh/id_rsa y ~/.ssh/id_rsa.pub.
+
+    Devuelve (resultados, clave pública del servidor o None).
+    """
+    rs = []
+    dir_ssh = os.path.join(home, ".ssh")
+    ruta_pub = os.path.join(dir_ssh, "id_rsa.pub")
+    ruta_priv = os.path.join(dir_ssh, "id_rsa")
+
+    datos_pub = leer_bytes(ruta_pub)
+    publica = None
+    if datos_pub is None:
+        otras = sorted(n for n in _listar(dir_ssh)
+                       if n.startswith("id_") and n.endswith(".pub"))
+        rs.append(error(
+            "No existe ~/.ssh/id_rsa.pub (o no se puede leer)", fallo="B7",
+            detalle=["En ~/.ssh hay: %s." % ", ".join(otras)] if otras else [],
+            efecto="no hay clave pública que poner en user-data.",
+            arreglo="genere la pareja de claves RSA con «ssh-keygen -t rsa» y "
+                    "acepte el nombre que propone.",
+            seccion="preliminar"))
+    else:
+        publica = analizar_clave_publica(datos_pub.decode("utf-8", "replace"))
+        if publica is None:
+            rs.append(error(
+                "~/.ssh/id_rsa.pub no contiene una clave pública válida", fallo="B7",
+                arreglo="si conserva ~/.ssh/id_rsa, puede volver a obtener la "
+                        "pública con «ssh-keygen -y -f ~/.ssh/id_rsa».",
+                seccion="preliminar"))
+        elif publica.tipo != "ssh-rsa":
+            rs.append(aviso(
+                "~/.ssh/id_rsa.pub es de tipo %s, no RSA" % publica.tipo,
+                arreglo="el manual usa claves RSA («ssh-keygen -t rsa»).",
+                seccion="preliminar"))
+        else:
+            rs.append(ok("~/.ssh/id_rsa.pub: clave RSA %s" % publica.huella))
+
+    try:
+        st = os.stat(ruta_priv)
+    except OSError:
+        rs.append(error(
+            "No existe ~/.ssh/id_rsa", fallo="B7",
+            efecto="ssh no tiene con qué entrar en las máquinas: "
+                   "«Permission denied (publickey)».",
+            arreglo="si la borró, genere una pareja nueva («ssh-keygen -t rsa») y "
+                    "rehaga user-data y las máquinas creadas con la anterior.",
+            seccion="faq-publickey"))
+        return rs, publica
+
+    if st.st_mode & 0o077:
+        rs.append(error(
+            "~/.ssh/id_rsa tiene permisos %s: puede leerla alguien más" % _modo(st),
+            fallo="B10",
+            efecto="ssh se niega a usar una clave privada que pueden leer otros, "
+                   "y la máquina responderá «Permission denied (publickey)».",
+            arreglo="chmod 600 ~/.ssh/id_rsa", seccion="preliminar"))
+    else:
+        rs.append(ok("~/.ssh/id_rsa: solo la puede leer usted (%s)" % _modo(st)))
+
+    datos_priv = leer_bytes(ruta_priv)
+    if datos_priv is None:
+        rs.append(error("No se puede leer ~/.ssh/id_rsa", fallo="B10",
+                        arreglo="chmod 600 ~/.ssh/id_rsa", seccion="preliminar"))
+        return rs, publica
+    formato, cifrada, pub_de_priv = analizar_privada(datos_priv)
+    del datos_priv
+
+    if formato is None:
+        rs.append(error("~/.ssh/id_rsa no parece una clave privada", fallo="B7",
+                        seccion="preliminar"))
+        return rs, publica
+    if formato == "pem" and cifrada is False:
+        # Formato antiguo sin frase de paso: ssh-keygen calcula la pública
+        codigo, salida, _ = ejecutar(["ssh-keygen", "-y", "-P", "", "-f", ruta_priv])
+        if codigo == 0:
+            pub_de_priv = analizar_clave_publica(salida)
+
+    if publica is not None:
+        if pub_de_priv is None:
+            rs.append(omitida("Correspondencia entre id_rsa e id_rsa.pub: no se "
+                              "puede comprobar sin la frase de paso"))
+        elif pub_de_priv.blob == publica.blob:
+            rs.append(ok("~/.ssh/id_rsa e id_rsa.pub son pareja"))
+        else:
+            rs.append(error(
+                "~/.ssh/id_rsa e id_rsa.pub no son pareja", fallo="B7",
+                detalle=["id_rsa.pub:           %s" % publica.huella,
+                         "pública de id_rsa:    %s" % pub_de_priv.huella],
+                efecto="las máquinas creadas con esta id_rsa.pub no aceptarán su "
+                       "clave privada: «Permission denied (publickey)».",
+                arreglo="si id_rsa es la buena, vuelva a obtener la pública con "
+                        "«ssh-keygen -y -f ~/.ssh/id_rsa > ~/.ssh/id_rsa.pub» y "
+                        "póngala en user-data.",
+                seccion="faq-publickey"))
+
+    if cifrada is False:
+        rs.append(ok("La clave privada no tiene frase de paso: no necesita el agente"))
+    elif cifrada:
+        rs.append(comprobar_agente(pub_de_priv or publica))
+    # Sin id_rsa.pub, la clave con la que entra ssh es la de id_rsa
+    return rs, publica or pub_de_priv
+
+
+def _listar(directorio):
+    try:
+        return os.listdir(directorio)
+    except OSError:
+        return []
+
+
+def comprobar_agente(clave):
+    """D6: con frase de paso, la clave debería estar cargada en el agente."""
+    arreglo_agente = ("cárguela con «ssh-add» (si no funciona, antes "
+                      "«eval \"$(ssh-agent -s)\"»). Hay que hacerlo en cada sesión.")
+    efecto = ("ssh le pedirá la frase de paso cada vez. Si la teclea mal, "
+              "acabará en «Permission denied (publickey)» aunque todo esté bien.")
+    if not os.environ.get("SSH_AUTH_SOCK"):
+        return aviso("Su clave tiene frase de paso y no hay agente en esta sesión",
+                     fallo="D6", efecto=efecto, arreglo=arreglo_agente,
+                     seccion="preliminar")
+    codigo, salida, _ = ejecutar(["ssh-add", "-L"], timeout=10)
+    if codigo == 0:
+        cargadas = [analizar_clave_publica(l) for l in salida.splitlines()]
+        if clave is not None and any(c and c.blob == clave.blob for c in cargadas):
+            return ok("Su clave está cargada en el agente")
+        return aviso(
+            "El agente no tiene su clave ~/.ssh/id_rsa", fallo="D6",
+            detalle=["El agente tiene %d clave(s) de otro origen (si entró al "
+                     "servidor con «ssh -A», son las de su ordenador)." % len(cargadas)],
+            efecto=efecto, arreglo=arreglo_agente, seccion="preliminar")
+    if codigo == 1:
+        return aviso("El agente no tiene ninguna clave cargada", fallo="D6",
+                     efecto=efecto, arreglo=arreglo_agente, seccion="preliminar")
+    return aviso("No se puede consultar el agente de claves", fallo="D6",
+                 efecto=efecto, arreglo="«eval \"$(ssh-agent -s)\"» y después «ssh-add».",
+                 seccion="preliminar")
+
+
+# --- Archivos de cloud-init (B1, B4, B5, B6) ----------------------------------
+#
+# Criterio de gravedad: ERROR cuando el efecto se conoce (YAML inválido, sin
+# #cloud-config, sin el usuario, clave que no es la del servidor...); AVISO
+# cuando solo se aparta del manual y el efecto no está comprobado.
+
+FALLO_DE = {"user-data": "B4", "meta-data": None, "network-config": "B6"}
+SECCION_DE = {"user-data": "preliminar", "meta-data": "instanciar",
+              "network-config": "instanciar"}
+
+
+class Red:
+    """Lo que hace falta saber de la red del alumno para revisar su IP."""
+
+    def __init__(self, nombre, red, pasarela, dhcp=()):
+        self.nombre = nombre
+        self.red = ipaddress.ip_network(red)
+        self.pasarela = ipaddress.ip_address(pasarela)
+        self.dhcp = [(ipaddress.ip_address(a), ipaddress.ip_address(b)) for a, b in dhcp]
+
+    def en_dhcp(self, ip):
+        return any(a <= ip <= b for a, b in self.dhcp)
+
+
+def escapar_nombre(nombre):
+    """Nombre de archivo (bytes) como lo muestra «ls -b»."""
+    trozos = []
+    for b in nombre:
+        c = chr(b)
+        if c == " ":
+            trozos.append("\\ ")
+        elif c == "\\":
+            trozos.append("\\\\")
+        elif 0x21 <= b <= 0x7e:
+            trozos.append(c)
+        else:
+            trozos.append("\\%03o" % b)
+    return "".join(trozos)
+
+
+def _invisible(c):
+    cat = unicodedata.category(c)
+    return cat == "Cf" or (cat == "Zs" and c != " ") or c in "  "
+
+
+def _base_de_nombre(nombre):
+    """Nombre reducido para reconocer variantes: sin invisibles, en minúsculas,
+    sin extensiones ni marcas de copias de editores."""
+    n = "".join(c for c in nombre.decode("utf-8", "replace") if not _invisible(c))
+    n = n.strip().lower()
+    n = re.sub(r"\.sw[a-p]$", "", n)
+    n = re.sub(r"^\.", "", n)
+    n = re.sub(r"(~|\.(ya?ml|txt|bak|orig|save|old))+$", "", n)
+    return n.replace("_", "-")
+
+
+def comprobar_nombres(directorio):
+    """Que existan user-data, meta-data y network-config con esos nombres exactos.
+
+    Devuelve {nombre: (resultados, bytes o None)}.
+    """
+    salida = {}
+    try:
+        entradas = os.listdir(os.fsencode(directorio))
+    except OSError:
+        entradas = []
+    for nombre in ARCHIVOS_CI:
+        rs = []
+        salida[nombre] = (rs, None)
+        exacto = nombre.encode()
+        variantes = sorted(e for e in entradas
+                           if e != exacto and _base_de_nombre(e) == nombre)
+        ruta = os.path.join(directorio, nombre)
+        detalle = ["Hay un archivo parecido: %s" % escapar_nombre(v) for v in variantes]
+        if exacto not in entradas:
+            arreglo = "créelo con ese nombre exacto."
+            if len(variantes) == 1:
+                arreglo = "renómbrelo: mv %s %s" % (escapar_nombre(variantes[0]), nombre)
+            rs.append(error("No existe el archivo %s" % nombre, fallo=FALLO_DE[nombre],
+                            detalle=detalle,
+                            efecto="virt-install no podrá usarlo.",
+                            arreglo=arreglo, seccion=SECCION_DE[nombre]))
+            continue
+        if not os.path.isfile(ruta):
+            rs.append(error("%s no es un archivo normal" % nombre, fallo=FALLO_DE[nombre],
+                            seccion=SECCION_DE[nombre]))
+            continue
+        datos = leer_bytes(ruta)
+        if datos is None:
+            rs.append(error("No se puede leer %s" % nombre, fallo=FALLO_DE[nombre],
+                            arreglo="chmod 644 %s" % nombre, seccion=SECCION_DE[nombre]))
+        elif variantes:
+            rs.append(aviso(
+                "Además de %s hay otros archivos con un nombre parecido" % nombre,
+                detalle=detalle,
+                efecto="virt-install solo usa %s." % nombre,
+                arreglo="compruebe que el que editó es %s." % nombre,
+                seccion=SECCION_DE[nombre]))
+        else:
+            rs.append(ok("Existe %s" % nombre))
+        salida[nombre] = (rs, datos)
+    return salida
+
+
+def _lineas_de(apariciones, maximo=6):
+    lineas = sorted(set(n for n, _ in apariciones))
+    texto = ", ".join(str(n) for n in lineas[:maximo])
+    if len(lineas) > maximo:
+        texto += " y %d más" % (len(lineas) - maximo)
+    return ("línea " if len(lineas) == 1 else "líneas ") + texto
+
+
+def _codigos(apariciones):
+    return ", ".join(sorted(set("U+%04X" % ord(c) for _, c in apariciones)))
+
+
+RAYAS = "‐‑‒–—―−"
+COMILLAS = "‘’‚‛“”„"
+
+
+def comprobar_texto(nombre, datos):
+    """Caracteres que no deberían estar: invisibles, rayas, comillas curvas,
+    tabuladores, BOM, CRLF. Nunca se muestra el contenido de las líneas.
+
+    Devuelve (resultados, texto o None si no es UTF-8).
+    """
+    rs = []
+    fallo, seccion = FALLO_DE[nombre], SECCION_DE[nombre]
+    try:
+        texto = datos.decode("utf-8")
+    except UnicodeDecodeError as e:
+        linea = datos[:e.start].count(b"\n") + 1
+        rs.append(error("%s no es texto UTF-8 (línea %d)" % (nombre, linea), fallo="B1",
+                        arreglo="vuelva a escribir esa línea a mano con nano.",
+                        seccion=seccion))
+        return rs, None
+
+    if texto.startswith("﻿"):
+        r = error if nombre == "user-data" else aviso
+        rs.append(r("%s empieza por un carácter invisible (BOM)" % nombre, fallo="B1",
+                    efecto="la primera línea ya no es exactamente la que espera cloud-init."
+                    if nombre == "user-data" else None,
+                    arreglo="vuelva a escribir la primera línea a mano con nano.",
+                    seccion=seccion))
+        texto = texto[1:]
+
+    invisibles, rayas, comillas, tabs = [], [], [], []
+    for n, linea in enumerate(texto.split("\n"), 1):
+        for c in linea:
+            if c == "\t":
+                tabs.append((n, c))
+            elif c in RAYAS:
+                rayas.append((n, c))
+            elif c in COMILLAS:
+                comillas.append((n, c))
+            elif _invisible(c):
+                invisibles.append((n, c))
+
+    copiar = ("suele pasar al copiar del PDF o de la web. Escriba esa parte a mano "
+              "con nano.")
+    if invisibles:
+        rs.append(error("%s tiene caracteres invisibles (%s)" % (nombre, _lineas_de(invisibles)),
+                        fallo="B1",
+                        detalle=["Caracteres: %s." % _codigos(invisibles)],
+                        arreglo=copiar, seccion=seccion))
+    if rayas:
+        rs.append(error("%s tiene rayas en lugar de guiones (%s)" % (nombre, _lineas_de(rayas)),
+                        fallo="B1",
+                        detalle=["Caracteres: %s; el guion es «-»." % _codigos(rayas)],
+                        arreglo=copiar, seccion=seccion))
+    if comillas:
+        rs.append(error("%s tiene comillas curvas (%s)" % (nombre, _lineas_de(comillas)),
+                        fallo="B1",
+                        detalle=["Caracteres: %s; la comilla es «'»." % _codigos(comillas)],
+                        arreglo=copiar, seccion=seccion))
+    if tabs:
+        rs.append(error("%s tiene tabuladores (%s)" % (nombre, _lineas_de(tabs)), fallo=fallo,
+                        efecto="YAML no admite tabuladores para indentar.",
+                        arreglo="sustitúyalos por espacios, respetando la indentación del manual.",
+                        seccion=seccion))
+    if "\r" in texto:
+        rs.append(aviso("%s tiene finales de línea de Windows (CRLF)" % nombre, fallo="B1",
+                        arreglo="escríbalo con nano en el servidor, o conviértalo: "
+                                "sed -i 's/\\r$//' %s" % nombre,
+                        seccion=seccion))
+    if not rs:
+        rs.append(ok("%s: sin caracteres extraños ni tabuladores" % nombre))
+    return rs, texto.replace("\r\n", "\n")
+
+
+def cargar_yaml(nombre, texto, mostrar_problema=True):
+    """(datos, None) si el YAML es válido; (None, Resultado) si no."""
+    if yaml is None:
+        return None, aviso("No se ha podido comprobar la sintaxis de %s: falta "
+                           "PyYAML en el servidor" % nombre,
+                           arreglo="avise al profesor.")
+    try:
+        return yaml.safe_load(texto), None
+    except yaml.YAMLError as e:
+        # Nunca str(e): incluye el texto de la línea, que podría ser una clave
+        detalle = []
+        marca = getattr(e, "problem_mark", None)
+        if marca is not None:
+            detalle.append("Línea %d, columna %d." % (marca.line + 1, marca.column + 1))
+        problema = getattr(e, "problem", None)
+        if problema and mostrar_problema:
+            detalle.append("PyYAML dice: %s" % problema)
+        return None, error("%s no es YAML válido" % nombre, fallo=FALLO_DE[nombre],
+                           detalle=detalle,
+                           efecto="cloud-init no podrá usarlo.",
+                           arreglo="revise la indentación (solo espacios) y los "
+                                   "dos puntos alrededor de esa línea, comparándolo "
+                                   "con el manual.",
+                           seccion=SECCION_DE[nombre])
+
+
+def _como_lista(valor):
+    if valor is None:
+        return []
+    if isinstance(valor, (list, tuple)):
+        return list(valor)
+    return [valor]
+
+
+def comprobar_user_data(texto, clave_servidor):
+    """Estructura de user-data y su clave (B4, B5)."""
+    rs = []
+    sec = "preliminar"
+    privada = bool(PRIVADA_RE.search(texto))
+    if privada:
+        rs.append(error(
+            "user-data contiene una clave privada", fallo="B5",
+            efecto="la clave privada no sirve para entrar y queda copiada en la máquina.",
+            arreglo="quítela y ponga en su lugar el contenido de ~/.ssh/id_rsa.pub "
+                    "(la pública, que empieza por ssh-rsa).",
+            seccion=sec))
+
+    lineas = texto.split("\n")
+    if lineas[0].rstrip() == "#cloud-config":
+        rs.append(ok("La primera línea de user-data es #cloud-config"))
+    else:
+        detalle = []
+        for n, l in enumerate(lineas[1:], 2):
+            if l.strip() == "#cloud-config":
+                detalle.append("Está en la línea %d: tiene que ser la primera." % n)
+                break
+        if not detalle and re.match(r"\s*#\s*cloud-config\s*$", lineas[0], re.I):
+            detalle.append("Se escribe exactamente así: #cloud-config, sin espacios "
+                           "y en minúsculas.")
+        rs.append(error("La primera línea de user-data no es #cloud-config", fallo="B4",
+                        detalle=detalle,
+                        efecto="cloud-init ignora el archivo: la máquina se crea sin "
+                               "el usuario administrador.",
+                        arreglo="escriba #cloud-config en la primera línea.",
+                        seccion=sec))
+
+    datos, problema = cargar_yaml("user-data", texto, mostrar_problema=not privada)
+    if problema:
+        rs.append(problema)
+        return rs
+    if not isinstance(datos, dict):
+        rs.append(error("user-data no tiene la estructura esperada", fallo="B4",
+                        arreglo="compárelo línea a línea con el del manual.",
+                        seccion=sec))
+        return rs
+
+    for clave in ("ssh_authorized_keys", "ssh-authorized-keys"):
+        if clave in datos:
+            rs.append(error(
+                "%s está fuera del usuario administrador" % clave, fallo="B4",
+                efecto="esa clave no se instala en administrador: "
+                       "«Permission denied (publickey)».",
+                arreglo="indéntelo dentro del usuario, al nivel de «shell:», como "
+                        "en el manual.",
+                seccion=sec))
+
+    usuarios = datos.get("users")
+    if usuarios is None:
+        detalle = []
+        parecidas = [k for k in datos if str(k).lower() in ("user", "usuarios", "usuario")]
+        if parecidas:
+            detalle.append("Hay «%s:»; tiene que ser «users:»." % parecidas[0])
+        rs.append(error("user-data no tiene la lista users", fallo="B4", detalle=detalle,
+                        efecto="no se crea el usuario administrador.",
+                        seccion=sec))
+        return rs
+    if not isinstance(usuarios, list):
+        rs.append(error("users no es una lista", fallo="B4",
+                        detalle=["Falta el guion antes de «name: administrador»."]
+                        if isinstance(usuarios, dict) else [],
+                        efecto="no se crea el usuario administrador.",
+                        arreglo="escriba «  - name: administrador», con el guion.",
+                        seccion=sec))
+        return rs
+
+    nombres = [u.get("name") for u in usuarios if isinstance(u, dict)]
+    admin = None
+    for u in usuarios:
+        if isinstance(u, dict) and u.get("name") == USUARIO_VM:
+            admin = u
+    if admin is None:
+        rs.append(error("user-data no crea el usuario administrador", fallo="B4",
+                        detalle=["Usuarios que crea: %s." % ", ".join(
+                            str(n) for n in nombres if n is not None)]
+                        if any(n is not None for n in nombres) else [],
+                        efecto="ssh administrador@... no podrá entrar.",
+                        arreglo="«- name: administrador», en minúsculas.",
+                        seccion=sec))
+        return rs
+    rs.append(ok("user-data crea el usuario administrador"))
+
+    sudo = [str(s) for s in _como_lista(admin.get("sudo"))]
+    if SUDO_ESPERADO in sudo:
+        rs.append(ok("administrador tiene sudo sin contraseña"))
+    elif not sudo:
+        rs.append(error("administrador no tiene la línea sudo", fallo="B4",
+                        efecto="no podrá usar sudo dentro de la máquina (por ejemplo, "
+                               "para instalar qemu-guest-agent).",
+                        arreglo="añada «    sudo: ['%s']»." % SUDO_ESPERADO,
+                        seccion=sec))
+    else:
+        rs.append(error("La regla de sudo no es la del manual", fallo="B4",
+                        detalle=["Tiene: %s" % "; ".join(sudo),
+                                 "Tiene que ser: %s" % SUDO_ESPERADO],
+                        efecto="sudo no funcionará como espera el manual.",
+                        seccion=sec))
+
+    grupos = admin.get("groups")
+    lista_grupos = (re.split(r"[,\s]+", grupos.strip()) if isinstance(grupos, str)
+                    else [str(g) for g in _como_lista(grupos)])
+    if "sudo" not in lista_grupos:
+        rs.append(aviso("administrador no está en el grupo sudo",
+                        arreglo="añada «    groups: sudo».", seccion=sec))
+    if admin.get("shell") != "/bin/bash":
+        rs.append(aviso("El intérprete de administrador no es /bin/bash",
+                        detalle=["Tiene: %s" % admin.get("shell")] if admin.get("shell")
+                        else [],
+                        arreglo="añada «    shell: /bin/bash».", seccion=sec))
+
+    rs += comprobar_claves_user_data(admin, clave_servidor)
+    return rs
+
+
+def _clave_partida(texto):
+    """Si la clave se pegó partida en varias líneas, YAML la une con espacios:
+    se prueba a quitarlos dentro de la parte en base64."""
+    partes = texto.split()
+    if len(partes) < 3:
+        return None
+    for fin in range(len(partes), 2, -1):
+        if all(re.match(r"^[A-Za-z0-9+/=]+$", p) for p in partes[1:fin]):
+            candidata = analizar_clave_publica(
+                partes[0] + " " + "".join(partes[1:fin]) + " " + " ".join(partes[fin:]))
+            if candidata is not None:
+                return candidata
+    return None
+
+
+def comprobar_claves_user_data(admin, clave_servidor):
+    rs = []
+    sec = "preliminar"
+    if "ssh_authorized_keys" in admin:
+        valor = admin["ssh_authorized_keys"]
+    elif "ssh-authorized-keys" in admin:
+        valor = admin["ssh-authorized-keys"]
+        rs.append(aviso("user-data usa ssh-authorized-keys (con guiones)", fallo="B4",
+                        efecto="es la forma antigua: cloud-init de Ubuntu 24.04 la "
+                               "trata como obsoleta.",
+                        arreglo="escríbalo con guiones bajos: ssh_authorized_keys.",
+                        seccion=sec))
+    else:
+        rs.append(error("administrador no tiene ssh_authorized_keys", fallo="B5",
+                        efecto="no podrá entrar: «Permission denied (publickey)».",
+                        seccion=sec))
+        return rs
+    if isinstance(valor, str):
+        rs.append(aviso("ssh_authorized_keys no es una lista",
+                        arreglo="ponga la clave en la línea siguiente, tras «- ».",
+                        seccion=sec))
+    claves = []
+    for i, texto in enumerate(_como_lista(valor), 1):
+        texto = str(texto)
+        if "CLAVE" in texto.upper() and "SSH-" not in texto.upper():
+            rs.append(error("En user-data sigue el texto de ejemplo, no su clave",
+                            fallo="B5",
+                            arreglo="sustitúyalo por el contenido de ~/.ssh/id_rsa.pub.",
+                            seccion=sec))
+            continue
+        clave = analizar_clave_publica(texto)
+        if clave is None:
+            partida = _clave_partida(texto)
+            if partida is not None:
+                rs.append(error("La clave de user-data está partida en varias líneas",
+                                fallo="B5",
+                                efecto="cloud-init instala una clave que no sirve: "
+                                       "«Permission denied (publickey)».",
+                                arreglo="póngala entera en una sola línea, tras «- ».",
+                                seccion=sec))
+                claves.append(partida)
+            else:
+                rs.append(error("La clave %d de user-data no es una clave pública válida" % i,
+                                fallo="B5",
+                                detalle=["Puede estar incompleta o partida al pegarla."],
+                                arreglo="copie de nuevo el contenido de ~/.ssh/id_rsa.pub, "
+                                        "en una sola línea.",
+                                seccion=sec))
+            continue
+        claves.append(clave)
+    if not claves:
+        return rs
+    if clave_servidor is None:
+        rs.append(omitida("Clave de user-data: no se puede comparar con ~/.ssh/id_rsa.pub"))
+    elif any(c.blob == clave_servidor.blob for c in claves):
+        rs.append(ok("La clave de user-data es la de ~/.ssh/id_rsa.pub"))
+    else:
+        rs.append(error(
+            "La clave de user-data no es la de ~/.ssh/id_rsa.pub", fallo="B5",
+            detalle=["user-data:  %s" % c.describir() for c in claves]
+            + ["id_rsa.pub: %s" % clave_servidor.describir()],
+            efecto="ssh responderá «Permission denied (publickey)».",
+            arreglo="copie en user-data el contenido de ~/.ssh/id_rsa.pub, la del "
+                    "servidor (no la de su ordenador).",
+            seccion=sec))
+    return rs
+
+
+def comprobar_meta_data(texto, uvus, maquina):
+    """meta-data: instance-id y local-hostname. Devuelve (resultados, datos)."""
+    rs = []
+    sec = "instanciar"
+    datos, problema = cargar_yaml("meta-data", texto)
+    if problema:
+        return [problema], None
+    if not isinstance(datos, dict):
+        return [error("meta-data no tiene la estructura esperada",
+                      arreglo="dos líneas: instance-id: ... y local-hostname: ...",
+                      seccion=sec)], None
+    iid = datos.get("instance-id")
+    host = datos.get("local-hostname")
+    if maquina is None and host:
+        maquina = str(host)
+    esperado = "%s-%s" % (uvus, maquina) if maquina else None
+    if iid is None:
+        rs.append(aviso("meta-data no tiene instance-id",
+                        arreglo="instance-id: %s" % (esperado or "<uvus>-serverX"),
+                        seccion=sec))
+    elif "su_usuario" in str(iid):
+        rs.append(aviso("El instance-id de meta-data es el texto de ejemplo del manual",
+                        detalle=["Tiene: %s" % iid],
+                        arreglo="instance-id: %s" % (esperado or "<uvus>-serverX"),
+                        seccion=sec))
+    elif esperado and str(iid) != esperado:
+        rs.append(aviso("El instance-id de meta-data no es %s" % esperado,
+                        detalle=["Tiene: %s" % iid],
+                        efecto="si es el de otra máquina suya, puede estar "
+                               "diagnosticando los archivos de esa otra máquina.",
+                        seccion=sec))
+    elif esperado:
+        rs.append(ok("meta-data: instance-id %s" % iid))
+    if host is None:
+        rs.append(aviso("meta-data no tiene local-hostname",
+                        arreglo="local-hostname: %s" % (maquina or "serverX"), seccion=sec))
+    elif maquina and str(host) != maquina:
+        rs.append(aviso("El local-hostname de meta-data no es %s" % maquina,
+                        detalle=["Tiene: %s" % host], seccion=sec))
+    elif maquina:
+        rs.append(ok("meta-data: local-hostname %s" % host))
+    return rs, datos
+
+
+def comprobar_network_config(texto, red=None):
+    """network-config (B6). Devuelve (resultados, IP o None)."""
+    rs = []
+    sec = "instanciar"
+    datos, problema = cargar_yaml("network-config", texto)
+    if problema:
+        return [problema], None
+    if not isinstance(datos, dict):
+        return [error("network-config no tiene la estructura esperada", fallo="B6",
+                      arreglo="compárelo línea a línea con el del manual.",
+                      seccion=sec)], None
+    if datos.get("version") != 2:
+        rs.append(error("network-config no tiene «version: 2»", fallo="B6",
+                        detalle=["Tiene: version: %s" % datos.get("version")]
+                        if "version" in datos else [],
+                        efecto="cloud-init lo interpreta con otro formato.",
+                        seccion=sec))
+    ethernets = datos.get("ethernets")
+    if not isinstance(ethernets, dict):
+        rs.append(error("network-config no tiene el bloque ethernets", fallo="B6",
+                        efecto="la máquina no tendrá su IP fija.", seccion=sec))
+        return rs, None
+    if INTERFAZ not in ethernets:
+        rs.append(error("network-config no configura la interfaz %s" % INTERFAZ, fallo="B6",
+                        detalle=["Configura: %s." % ", ".join(str(k) for k in ethernets)],
+                        efecto="la máquina no tendrá su IP fija.",
+                        arreglo="la interfaz de las máquinas del manual se llama %s." % INTERFAZ,
+                        seccion=sec))
+        return rs, None
+    iface = ethernets[INTERFAZ]
+    if not isinstance(iface, dict):
+        rs.append(error("El bloque de %s está vacío o mal indentado" % INTERFAZ, fallo="B6",
+                        seccion=sec))
+        return rs, None
+
+    direcciones = [str(d) for d in _como_lista(iface.get("addresses"))]
+    if not direcciones:
+        rs.append(error("network-config no tiene addresses", fallo="B6",
+                        efecto="la máquina no tendrá su IP fija.", seccion=sec))
+        return rs, None
+    if len(direcciones) > 1:
+        rs.append(aviso("network-config tiene varias direcciones; el manual usa una",
+                        seccion=sec))
+    if "/" not in direcciones[0]:
+        rs.append(error("La dirección %s no lleva /24" % direcciones[0], fallo="B6",
+                        efecto="la máquina no tendrá su IP fija.",
+                        arreglo="escríbala así: %s/24" % direcciones[0], seccion=sec))
+        return rs, None
+    try:
+        interfaz = ipaddress.ip_interface(direcciones[0])
+    except ValueError:
+        rs.append(error("%s no es una dirección IP válida" % direcciones[0], fallo="B6",
+                        seccion=sec))
+        return rs, None
+    ip = interfaz.ip
+    if interfaz.network.prefixlen != 24:
+        rs.append(aviso("La dirección %s no es /24" % direcciones[0], seccion=sec))
+    if iface.get("dhcp4") in (True, "true", "yes"):
+        rs.append(aviso("network-config activa dhcp4 además de la IP fija", seccion=sec))
+
+    via = None
+    for ruta in _como_lista(iface.get("routes")):
+        if isinstance(ruta, dict) and str(ruta.get("to")) in ("default", "0.0.0.0/0"):
+            via = ruta.get("via")
+    if via is None and iface.get("gateway4"):
+        via = iface.get("gateway4")
+        rs.append(aviso("network-config usa gateway4, que está obsoleto",
+                        arreglo="use routes: - to: default / via: ..., como el manual.",
+                        seccion=sec))
+    pasarela = None
+    if via is None:
+        rs.append(error("network-config no tiene la ruta por defecto", fallo="B6",
+                        efecto="la máquina no saldrá de su red (apt update fallará).",
+                        seccion=sec))
+    else:
+        try:
+            pasarela = ipaddress.ip_address(str(via))
+        except ValueError:
+            rs.append(error("La pasarela %s no es una dirección IP" % via, fallo="B6",
+                            seccion=sec))
+
+    dns = [str(d) for d in _como_lista((iface.get("nameservers") or {}).get("addresses"))
+           ] if isinstance(iface.get("nameservers"), dict) else []
+    if not dns:
+        rs.append(aviso("network-config no tiene servidores DNS",
+                        efecto="la máquina no podrá resolver nombres (apt update fallará).",
+                        arreglo="añada el bloque nameservers del manual.", seccion=sec))
+    elif set(dns) != set(DNS_ESPERADOS):
+        rs.append(aviso("Los DNS de network-config no son los del manual",
+                        detalle=["Tiene: %s" % ", ".join(dns),
+                                 "El manual: %s" % ", ".join(DNS_ESPERADOS)],
+                        seccion=sec))
+
+    if red is None:
+        rs.append(omitida("IP %s y pasarela: sin comprobar contra su red" % ip))
+        return rs, ip
+    rango = "de %s a %s" % (red.dhcp[0][0], red.dhcp[0][1]) if red.dhcp else ""
+    if ip not in red.red:
+        rs.append(error("La IP %s no es de su red %s (%s)" % (ip, red.nombre, red.red),
+                        fallo="B6", efecto="no podrá llegar a la máquina.",
+                        arreglo="use una IP de %s, entre la .2 y la .127." % red.red,
+                        seccion=sec))
+    elif ip in (red.red.network_address, red.red.broadcast_address, red.pasarela):
+        rs.append(error("La IP %s está reservada en su red" % ip, fallo="B6",
+                        arreglo="use una entre la .2 y la .127.", seccion=sec))
+    elif red.en_dhcp(ip):
+        rs.append(aviso("La IP %s está dentro del rango del DHCP (%s)" % (ip, rango),
+                        fallo="B6",
+                        efecto="el DHCP puede dársela también a otra máquina.",
+                        arreglo="use una entre la .2 y la .127.", seccion="red"))
+    else:
+        rs.append(ok("IP %s: de su red y fuera del DHCP" % ip))
+    if pasarela is not None:
+        if pasarela == red.pasarela:
+            rs.append(ok("Pasarela %s: la de su red" % pasarela))
+        else:
+            rs.append(error("La pasarela %s no es la de su red (%s)" % (pasarela, red.pasarela),
+                            fallo="B6",
+                            efecto="la máquina no saldrá de su red.",
+                            arreglo="via: %s" % red.pasarela, seccion=sec))
+    return rs, ip
+
+
+# --- Programa principal --------------------------------------------------------
+
+USO = """\
+Uso: ci-diagnosis [serverX] [--antes | --acceso] [--ip IP]
+
+Revisa la construcción de una máquina virtual con cloud-init (manual,
+sección 5.4) y dice qué falla. Ejecútelo desde su silo (~/imagenesMV).
+
+  serverX     la máquina que quiere revisar: server1, 1 o <uvus>-server1.
+              Si no la indica, se toma del local-hostname de meta-data.
+  --antes     revisión antes de virt-install (silo, red, imagen, archivos,
+              claves).
+  --acceso    revisión de una máquina ya creada en la que no puede entrar.
+  --ip IP     la IP de la máquina, si no es la de su network-config.
+  --version   muestra la versión.
+  --ayuda     muestra esta ayuda.
+
+Solo lee: no cambia archivos, no arranca ni apaga máquinas y no muestra
+nunca su clave privada. Código de salida: 0 sin errores, 1 si hay algún
+ERROR, 2 si la herramienta no ha podido hacer la revisión.
+"""
+
+
+class ErrorDeUso(Exception):
+    pass
+
+
+def analizar_argumentos(argv):
+    opciones = {"maquina": None, "modo": None, "ip": None,
+                "ayuda": False, "version": False}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--ayuda", "-h", "--help"):
+            opciones["ayuda"] = True
+        elif a == "--version":
+            opciones["version"] = True
+        elif a in ("--antes", "--acceso"):
+            if opciones["modo"] and opciones["modo"] != a[2:]:
+                raise ErrorDeUso("--antes y --acceso no pueden ir juntas.")
+            opciones["modo"] = a[2:]
+        elif a == "--ip" or a.startswith("--ip="):
+            if a == "--ip":
+                i += 1
+                if i == len(argv):
+                    raise ErrorDeUso("falta la IP después de --ip.")
+                valor = argv[i]
+            else:
+                valor = a[len("--ip="):]
+            try:
+                opciones["ip"] = ipaddress.ip_address(valor)
+            except ValueError:
+                raise ErrorDeUso("«%s» no es una dirección IP." % valor)
+        elif a.startswith("-"):
+            raise ErrorDeUso("opción desconocida: %s (las opciones empiezan por "
+                             "dos guiones)." % a)
+        elif opciones["maquina"] is None:
+            opciones["maquina"] = a
+        else:
+            raise ErrorDeUso("sobra «%s»: indique una sola máquina." % a)
+        i += 1
+    return opciones
+
+
+def normalizar_maquina(nombre, uvus):
+    """server1, 1 o <uvus>-server1 → server1."""
+    if nombre is None:
+        return None
+    if nombre.startswith(uvus + "-"):
+        nombre = nombre[len(uvus) + 1:]
+    if nombre.isdigit():
+        nombre = "server" + nombre
+    return nombre
+
+
+def diagnosticar_antes(uvus, home, directorio, maquina, red=None):
+    """Comprobaciones antes de virt-install. Devuelve (informe, máquina)."""
+    informe = Informe()
+    res_claves, clave = comprobar_claves(home)
+
+    res = []
+    for nombre, (r, datos) in comprobar_nombres(directorio).items():
+        res += r
+        if datos is None:
+            continue
+        r, texto = comprobar_texto(nombre, datos)
+        res += r
+        if texto is None:
+            continue
+        if nombre == "user-data":
+            res += comprobar_user_data(texto, clave)
+        elif nombre == "meta-data":
+            r, meta = comprobar_meta_data(texto, uvus, maquina)
+            res += r
+            if maquina is None and isinstance(meta, dict) and meta.get("local-hostname"):
+                maquina = str(meta["local-hostname"])
+        else:
+            res += comprobar_network_config(texto, red)[0]
+    informe.bloque("Archivos de cloud-init", res)
+    informe.bloque("Claves SSH", res_claves)
+    return informe, maquina
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    for flujo in (sys.stdout, sys.stderr):
+        try:
+            flujo.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    try:
+        opciones = analizar_argumentos(argv)
+    except ErrorDeUso as e:
+        print("ci-diagnosis: %s" % e, file=sys.stderr)
+        print("Consulte la ayuda con: ci-diagnosis --ayuda", file=sys.stderr)
+        return 2
+    if opciones["ayuda"]:
+        print(USO, end="")
+        return 0
+    if opciones["version"]:
+        print("ci-diagnosis %s" % VERSION)
+        return 0
+    if opciones["modo"] == "acceso":
+        print("ci-diagnosis: --acceso todavía no está disponible.", file=sys.stderr)
+        return 2
+
+    # El usuario de la cuenta, no el de las variables de entorno. Para las
+    # pruebas locales se puede fijar con CI_DIAGNOSIS_USUARIO.
+    uvus = (os.environ.get("CI_DIAGNOSIS_USUARIO")
+            or pwd.getpwuid(os.getuid()).pw_name)
+    home = os.path.expanduser("~")
+    directorio = os.getcwd()
+    maquina = normalizar_maquina(opciones["maquina"], uvus)
+    informe, maquina = diagnosticar_antes(uvus, home, directorio, maquina)
+
+    servidor = os.uname().nodename.split(".")[0]
+    print("ci-diagnosis %s · %s · usuario: %s · máquina: %s" % (
+        VERSION, servidor, uvus, "%s-%s" % (uvus, maquina) if maquina else "sin determinar"))
+    print("Modo: antes de virt-install")
+    print("(Versión en desarrollo: de momento solo revisa los archivos de "
+          "cloud-init y las claves.)")
+    print()
+    for linea in formatear_informe(informe, usar_color(sys.stdout)):
+        print(linea)
+    return informe.codigo_salida()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
