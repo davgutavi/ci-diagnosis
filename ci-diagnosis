@@ -1173,19 +1173,36 @@ def _nombres_no_utf8(ruta):
     return malos
 
 
+def _es_error_de_libvirt(e):
+    return type(e).__name__ == "libvirtError"
+
+
 def comprobar_entorno_compartido(silos, home):
     """A1: virt-install recorre los volúmenes de todos los silos activos (con
-    XMLDesc de cada volumen) y falla para todos si alguno no se puede leer."""
+    XMLDesc de cada volumen) y falla para todos si alguno no se puede leer.
+
+    Un error de libvirt no cuenta: virt-install lo captura y sigue. Es lo que pasa
+    con un volumen que ya no existe porque se borró con rm (visto en avantasia el
+    6-nov: «Storage volume not found»). Lo que hace fallar a virt-install es otro
+    tipo de error, como el UnicodeDecodeError de un nombre que no es UTF-8."""
     fallan = []
     for s in silos:
         if not s.activo:
             continue
         try:
-            for v in s.pool.listAllVolumes(0):
+            volumenes = s.pool.listAllVolumes(0)
+        except Exception as e:
+            if not _es_error_de_libvirt(e):
+                fallan.append(s)
+            continue
+        for v in volumenes:
+            try:
                 v.name()
                 v.XMLDesc(0)
-        except Exception:
-            fallan.append(s)
+            except Exception as e:
+                if not _es_error_de_libvirt(e):
+                    fallan.append(s)
+                    break
     revisados = sum(1 for s in silos if s.activo)
     if not fallan:
         return [ok("Ningún silo del servidor impide usar virt-install "
@@ -1487,6 +1504,8 @@ def comprobar_imagen_y_disco(directorio, maquina):
     crear = ("qemu-img create %s -f qcow2 -b %s -F qcow2 40G" % (nombre, IMAGEN_BASE))
     if not os.path.exists(disco):
         rs.append(error("No existe el disco %s" % nombre, fallo="B3",
+                        efecto="virt-install dirá «Size must be specified for non existent "
+                               "volume '%s'»." % nombre,
                         arreglo=crear, seccion="instanciar"))
         return rs
     info, problema = info_imagen(disco)
@@ -1559,7 +1578,8 @@ def comprobar_nombres_libres(conn, uvus, home, directorio, maquina, ip=None, red
         if nombre in nombres:
             existe = True
             rs.append(error("Ya existe la máquina %s" % nombre, fallo="C2",
-                            efecto="virt-install dirá que el nombre está en uso.",
+                            efecto="virt-install dirá «Guest name '%s' is already in use.»"
+                               % nombre,
                             arreglo="si quiere volver a crearla, apáguela y elimínela "
                                     "con su disco (virsh destroy y virsh undefine "
                                     "--remove-all-storage). Si lo que pasa es que no puede "
@@ -1572,7 +1592,9 @@ def comprobar_nombres_libres(conn, uvus, home, directorio, maquina, ip=None, red
             if d.name() != nombre and disco in discos_de(d):
                 rs.append(error("El disco %s.qcow2 ya lo usa la máquina %s" % (maquina, d.name()),
                                 fallo="C2",
-                                efecto="dos máquinas no pueden usar el mismo disco.",
+                                efecto="virt-install dirá «Disk ... is already in use "
+                                       "by other guests» si la otra está encendida; si está "
+                                       "apagada, las dos acabarán estropeando el disco.",
                                 arreglo="cree un disco nuevo para esta máquina.",
                                 seccion="instanciar"))
 
@@ -1666,7 +1688,8 @@ def comprobar_permisos(directorio):
             modo = stat.S_IMODE(os.stat(d).st_mode)
             return [error("%s no puede atravesar %s (permisos %04o)" % (USUARIO_QEMU, d, modo),
                           fallo="B8",
-                          efecto="es probable que la máquina no pueda abrir su disco.",
+                          efecto="virt-install no podrá crear la máquina: «Cannot access "
+                                 "storage file ... Permission denied».",
                           arreglo="chmod o+x %s" % d, seccion="silo")]
     return [ok("%s puede llegar hasta %s" % (USUARIO_QEMU, directorio))]
 

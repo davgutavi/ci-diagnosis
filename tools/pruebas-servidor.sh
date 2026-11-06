@@ -667,6 +667,8 @@ fase_c() {
     rm -f "$SILO/otra.qcow2"
     ejecuta "$SILO" server1 --antes
     espera "ci-diagnosis --antes: ya existe la máquina" "Ya existe la máquina $VM \[C2\]"
+    # otra.qcow2 sigue en la lista de volúmenes del silo hasta que se refresque
+    no_aparece "...y un volumen borrado con rm no se toma por A1" "[A1]"
 
     titulo "C.3 Disco en uso por otra máquina encendida (C2)"
     info "virt-install $USUARIO-server2 con server1.qcow2 (mensaje real):"
@@ -690,22 +692,33 @@ fase_c() {
     eliminar_vm
 
     titulo "C.5 El registro de virt-install tras un error (C1)"
+    eliminar_vm
+    local antes_lineas
+    antes_lineas="$(grep -c 'Launched with command line' "$HOME/.cache/virt-manager/virt-install.log" 2>/dev/null || echo 0)"
     preparar_bien
-    info "virt-install con un espacio tras la coma:"
     (cd "$SILO" && virt-install --name="$VM" --cloud-init user-data=user-data, \
         meta-data=meta-data,network-config=network-config --ram=2048 --vcpus=2 --import \
         --disk path=server1.qcow2 --os-variant=ubuntu24.04 --network network="$USUARIO-red" \
         --noautoconsole >/dev/null 2>&1)
-    info "lo que queda en el registro:"
-    registro_virt_install
+    if [[ "$(grep -c 'Launched with command line' "$HOME/.cache/virt-manager/virt-install.log")" == "$antes_lineas" ]]; then
+        info "el espacio tras la coma no deja nada en el registro (virt-install lo rechaza antes)"
+    else
+        info "el espacio tras la coma SÍ deja una orden en el registro:"
+        registro_virt_install
+    fi
+    info "virt-install sin el disco (mensaje real y registro):"
+    rm -f "$SILO/server1.qcow2"
+    virt_install "$VM" server1.qcow2
     ejecuta "$SILO" server1 --antes
-    espera "ci-diagnosis --antes: el último virt-install tenía un espacio tras la coma" \
-        'espacio tras una coma'
-    eliminar_vm
-    info "y tras una creación correcta, el registro:"
+    espera "ci-diagnosis --antes: el último virt-install falló, con su mensaje" \
+        'Size must be specified for non existent volume'
+    info "virt-install correcto y después eliminada (registro):"
+    preparar_bien
     crear_vm
     registro_virt_install
     eliminar_vm
+    ejecuta "$SILO" server1 --antes
+    espera "ci-diagnosis --antes: «ya la creó y después la eliminó»" 'Ya la creó el .* y después la eliminó'
 }
 
 case "$FASE" in
