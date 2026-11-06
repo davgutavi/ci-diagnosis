@@ -94,6 +94,9 @@ tienen que probarse como los verá un alumno.
   otros. Crea `<usuario>-lab` (Ubuntu 22.04, con las mismas versiones de libvirt y
   `virt-install` que el servidor), instala libvirt dentro y los provoca en ese
   libvirt, donde no hay alumnos. Descarga la imagen de 22.04 la primera vez.
+- **Fase e:** B9 (silo sobre un directorio que no existía), B3 con máquina
+  (disco menor que la base, base movida), D5 (dos máquinas encendidas con la
+  misma IP) y D6 (frase de paso tecleada mal). Unos 10 minutos.
 
 El registro completo queda en `/tmp/pruebas-ci-diagnosis-<usuario>-<fecha>.log`.
 
@@ -121,6 +124,10 @@ la cuenta de prueba está activo y haría fallar `virt-install` a todos (A1).
 - **Nunca apaga ni arranca máquinas.** Si para leer el disco hace falta
   apagarla, se le pide al alumno. El disco se lee con `guestfish --ro` en una
   sola sesión (cada arranque de libguestfs tarda de 8 a 15 s en los servidores).
+- **ssh, nunca con contraseña.** La prueba de acceso solo usa la clave
+  (`PreferredAuthentications=publickey`, `PasswordAuthentication=no`, …): un ssh
+  que no puede preguntar acaba enviando contraseñas vacías, y cada una cuenta
+  como «Failed password» para fail2ban (catálogo, A4 y E4).
 - **ssh, sin falsos negativos.** `BatchMode=yes` no puede pedir la frase de
   paso: si la clave la tiene y no está en el agente, el resultado es «no
   concluyente», no un error. Y nunca escribe en `known_hosts`: con una entrada

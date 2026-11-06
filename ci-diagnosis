@@ -1835,7 +1835,9 @@ def comprobar_conectividad(ip):
     espere = "Si acaba de crearla o de arrancarla, espere medio minuto y repita."
     if puerto == "rechazado":
         rs.append(error("La máquina rechaza la conexión al puerto 22", fallo="D1",
-                        detalle=["ssh dice «Connection refused».", espere],
+                        detalle=["ssh dice «Connection refused».",
+                                 "Quien rechaza es la máquina virtual, no el servidor de la "
+                                 "asignatura.", espere],
                         efecto="la máquina tiene la IP, pero ssh todavía no escucha "
                                "(o la máquina se ha quedado en modo de emergencia).",
                         seccion="acceso"))
@@ -1856,8 +1858,13 @@ def comprobar_conectividad(ip):
 
 
 def _ssh(ip, home, known_hosts, estricto):
+    # Solo con clave, nunca con contraseña: un ssh que no puede preguntar acaba
+    # enviando contraseñas vacías, y cada una cuenta como «Failed password»
+    # (catálogo, A4 y E4)
     opciones = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
                 "-o", "ConnectionAttempts=1", "-o", "NumberOfPasswordPrompts=0",
+                "-o", "PreferredAuthentications=publickey",
+                "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
                 "-o", "UpdateHostKeys=no", "-o", "IdentitiesOnly=yes",
                 "-i", os.path.join(home, ".ssh", "id_rsa"),
                 "-o", "UserKnownHostsFile=%s" % known_hosts,

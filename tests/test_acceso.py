@@ -102,6 +102,11 @@ class TestSsh(unittest.TestCase):
         self.assertIn("UpdateHostKeys=no", orden)
         self.assertIn("BatchMode=yes", orden)
         self.assertIn("administrador@192.168.7.2 true", orden)
+        # Nunca contraseñas: no deja «Failed password» en ninguna parte (A4, E4)
+        for opcion in ("NumberOfPasswordPrompts=0", "PasswordAuthentication=no",
+                       "KbdInteractiveAuthentication=no",
+                       "PreferredAuthentications=publickey"):
+            self.assertIn(opcion, orden)
 
     def test_con_known_hosts_es_estricto(self):
         _, _, ordenes = self.revisar(True, [(0, "", "")])

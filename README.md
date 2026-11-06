@@ -52,6 +52,16 @@ ci-diagnosis server1 --ip 192.168.XXX.YYY   # si la IP no es la de su network-co
 ci-diagnosis --ayuda
 ```
 
+## Lo que no revisa
+
+La conexión desde su ordenador hasta el servidor: sus claves y su agente en el
+ordenador, `virt-manager` o un bloqueo del servidor por demasiados intentos
+fallidos. Si no puede conectarse al servidor, consulte la sección 4.5 del manual
+y la FAQ.
+
+`ci-diagnosis` tampoco cuenta nunca como un intento fallido: para comprobar si
+puede entrar en su máquina usa solo su clave, nunca una contraseña.
+
 ## Cómo leer el resultado
 
 Cada comprobación da una de estas respuestas:
