@@ -12,7 +12,7 @@ import os
 import sys
 
 RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ORDEN = ["base", "textos", "claves", "archivos", "main"]
+ORDEN = ["base", "textos", "claves", "archivos", "servidor", "main"]
 CABECERA = "#!/usr/bin/python3\n"
 
 

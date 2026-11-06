@@ -4,10 +4,12 @@ import contextlib
 import io
 import os
 import re
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
 
+import falso_libvirt as fl
 from comun import (META_DATA, NETWORK_CONFIG, SCRIPT, USER_DATA, Claves, cd, escribir,
                    leer, necesita_yaml)
 
@@ -99,32 +101,86 @@ class TestOpciones(unittest.TestCase):
         self.assertEqual(codigo, 2)
         self.assertIn("--ayuda", errores)
 
+    def preparar_alumno(self, home):
+        """Un alumno que lo ha hecho todo bien: claves, silo, red, imagen,
+        disco y los tres archivos. Devuelve la conexión simulada."""
+        os.mkdir(os.path.join(home, ".ssh"), 0o700)
+        silo = os.path.join(home, "imagenesMV")
+        os.mkdir(silo)
+        Claves.preparar()
+        with open(Claves.sin_frase, "rb") as f:
+            escribir(os.path.join(home, ".ssh", "id_rsa"), f.read(), 0o600)
+        escribir(os.path.join(home, ".ssh", "id_rsa.pub"), Claves.publica("sin_frase"))
+        escribir(os.path.join(silo, "user-data"),
+                 USER_DATA.format(clave=Claves.publica("sin_frase")))
+        escribir(os.path.join(silo, "meta-data"), META_DATA)
+        escribir(os.path.join(silo, "network-config"), NETWORK_CONFIG)
+        base = os.path.join(silo, cd.IMAGEN_BASE)
+        for args in (["-f", "qcow2", base, "3758096384"],
+                     [os.path.join(silo, "server1.qcow2"), "-f", "qcow2", "-b",
+                      cd.IMAGEN_BASE, "-F", "qcow2", "40G"]):
+            subprocess.run(["qemu-img", "create", "-q"] + args, check=True)
+        os.chmod(base, 0o644)
+        os.chmod(os.path.join(silo, "server1.qcow2"), 0o644)
+        return silo, fl.Conexion(
+            silos=[fl.Silo("alu0000-imagenesMV", silo,
+                           volumenes=[fl.Volumen(cd.IMAGEN_BASE)])],
+            redes=[fl.Red("alu0000-red")],
+            dominios=[fl.Dominio("zzz9999-server1", ["/home/zzz9999/server1.qcow2"])])
+
+    def ejecutar_en(self, home, silo, conn, argv=()):
+        entorno = {"HOME": home, "CI_DIAGNOSIS_USUARIO": "alu0000"}
+        anterior = os.getcwd()
+        try:
+            os.chdir(silo)
+            with mock.patch.dict(os.environ, entorno), fl.instalado(conn), \
+                    mock.patch.object(cd, "responde_ping", return_value=False):
+                return self.ejecutar_main(list(argv))
+        finally:
+            os.chdir(anterior)
+
     @necesita_yaml
     def test_de_principio_a_fin(self):
-        with tempfile.TemporaryDirectory() as home:
-            os.mkdir(os.path.join(home, ".ssh"), 0o700)
-            silo = os.path.join(home, "imagenesMV")
-            os.mkdir(silo)
-            Claves.preparar()
-            with open(Claves.sin_frase, "rb") as f:
-                escribir(os.path.join(home, ".ssh", "id_rsa"), f.read(), 0o600)
-            escribir(os.path.join(home, ".ssh", "id_rsa.pub"), Claves.publica("sin_frase"))
-            escribir(os.path.join(silo, "user-data"),
-                     USER_DATA.format(clave=Claves.publica("sin_frase")))
-            escribir(os.path.join(silo, "meta-data"), META_DATA)
-            escribir(os.path.join(silo, "network-config"), NETWORK_CONFIG)
-            entorno = {"HOME": home, "CI_DIAGNOSIS_USUARIO": "alu0000"}
-            anterior = os.getcwd()
-            try:
-                os.chdir(silo)
-                with mock.patch.dict(os.environ, entorno):
-                    codigo, salida, _ = self.ejecutar_main([])
-            finally:
-                os.chdir(anterior)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.realpath(tmp)
+            silo, conn = self.preparar_alumno(home)
+            codigo, salida, _ = self.ejecutar_en(home, silo, conn)
         self.assertEqual(codigo, 0, salida)
         self.assertIn("máquina: alu0000-server1", salida)
         self.assertIn("Resultado: todo correcto.", salida)
+        self.assertNotIn("ERROR", salida)
         self.assertNotIn("\033[", salida)
+        self.assertTrue(conn.cerrada)
+        orden = [l for l in salida.splitlines() if l and l == l.upper() and l[0].isalpha()]
+        self.assertEqual(orden, ["ENTORNO COMPARTIDO", "DIRECTORIO Y SILO", "RED",
+                                 "IMAGEN Y DISCO", "ARCHIVOS DE CLOUD-INIT", "CLAVES SSH",
+                                 "NOMBRES LIBRES", "PERMISOS"])
+
+    @necesita_yaml
+    def test_con_errores_sale_con_1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.realpath(tmp)
+            silo, conn = self.preparar_alumno(home)
+            conn.redes = []
+            codigo, salida, _ = self.ejecutar_en(home, silo, conn)
+        self.assertEqual(codigo, 1)
+        self.assertIn("No existe la red alu0000-red", salida)
+
+    def test_la_maquina_ya_existe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.realpath(tmp)
+            silo, conn = self.preparar_alumno(home)
+            conn.dominios.append(fl.Dominio("alu0000-server1",
+                                            [os.path.join(silo, "server1.qcow2")]))
+            codigo, salida, _ = self.ejecutar_en(home, silo, conn, ["server1"])
+        self.assertEqual(codigo, 1)
+        self.assertIn("La máquina ya existe", salida)
+
+    def test_sin_libvirt(self):
+        with mock.patch.dict("sys.modules", {"libvirt": None}):
+            codigo, _, errores = self.ejecutar_main([])
+        self.assertEqual(codigo, 2)
+        self.assertIn("avise al profesor", errores)
 
 
 if __name__ == "__main__":
