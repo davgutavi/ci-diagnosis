@@ -841,7 +841,7 @@ sudo mkdir -p /home/otro
 sudo touch "/home/otro/$(printf 'datos\xc3')" /home/otro/normal.img
 $V pool-define-as otro dir --target /home/otro >/dev/null && $V pool-start otro >/dev/null
 echo "--- virt-install (mensaje real):"
-cd ~/imagenesMV && virt-install --name=administrador-server1 \
+cd ~/imagenesMV && virt-install --connect qemu:///system --name=administrador-server1 \
     --cloud-init user-data=user-data,meta-data=meta-data,network-config=network-config \
     --ram=2048 --vcpus=2 --import --disk path=server1.qcow2 --os-variant=ubuntu24.04 \
     --network network=administrador-red --noautoconsole 2>&1; echo "[código $?]"
@@ -873,7 +873,7 @@ $V pool-destroy otro >/dev/null; $V pool-undefine otro >/dev/null
 touch ~/imagenesMV/"$(printf 'datos\xc3')"
 $V pool-refresh administrador-imagenesMV >/dev/null
 echo "--- virt-install (mensaje real):"
-cd ~/imagenesMV && virt-install --name=administrador-server1 \
+cd ~/imagenesMV && virt-install --connect qemu:///system --name=administrador-server1 \
     --cloud-init user-data=user-data,meta-data=meta-data,network-config=network-config \
     --ram=2048 --vcpus=2 --import --disk path=server1.qcow2 --os-variant=ubuntu24.04 \
     --network network=administrador-red --noautoconsole 2>&1; echo "[código $?]"
