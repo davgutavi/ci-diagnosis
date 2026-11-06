@@ -56,6 +56,34 @@ Para probar el programa a mano con otro usuario, `CI_DIAGNOSIS_USUARIO` sustituy
 al de la cuenta (solo para pruebas; la herramienta solo lee, así que cambiarlo
 no da acceso a nada).
 
+## Pruebas en un servidor de la asignatura
+
+Con una **cuenta de alumno de prueba** (sin `sudo`, con los grupos de un alumno:
+`kvm`, `ssoo`, `libvirt`), nunca con la de un profesor: los permisos y libguestfs
+tienen que probarse como los verá un alumno.
+
+1. Preparar la cuenta una vez: `tools/preparar-cuenta-prueba.sh` crea
+   `~/imagenesMV`, el silo `<usuario>-imagenesMV`, la red `<usuario>-red` (con un
+   `XXX` libre entre 200 y 254) y copia o descarga la imagen base. Con `--quitar`
+   deshace el silo y la red, sin borrar archivos.
+2. Copiar `ci-diagnosis` y `tools/pruebas-servidor.sh` al mismo directorio del
+   servidor y lanzar, desde la cuenta de un profesor:
+
+   ```bash
+   sudo -iu CUENTA bash /ruta/pruebas-servidor.sh a
+   ```
+
+- **Fase a:** revisión `--antes`. Provoca cada fallo en el silo de la cuenta de
+  prueba (archivos, claves, disco, permisos), comprueba que `ci-diagnosis` lo
+  detecta y graba los mensajes reales (`qemu-img` sin `-F`, PyYAML,
+  `cloud-init schema`). No crea máquinas, silos ni redes, y deja el silo como
+  estaba.
+
+El registro completo queda en `/tmp/pruebas-ci-diagnosis-<usuario>-<fecha>.log`.
+
+**Nunca** se crea en el servidor un archivo cuyo nombre no sea UTF-8: el silo de
+la cuenta de prueba está activo y haría fallar `virt-install` a todos (A1).
+
 ## Lo que conviene saber antes de tocar el código
 
 - **Solo lee.** La conexión a libvirt es `openReadOnly("qemu:///system")`: libvirt
