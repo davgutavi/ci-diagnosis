@@ -195,6 +195,31 @@ class TestOrden(unittest.TestCase):
         rs = self.revisar(MANUAL.replace("--import ", ""), archivo="virt-install.log.2")
         self.assertIn("--import", texto_de(rs))
 
+    def test_con_error_en_el_registro(self):
+        escribir(os.path.join(self.home, ".cache", "virt-manager", "virt-install.log"),
+                 LINEA % MANUAL + "[Thu, 05 Nov 2026 10:00:01 virt-install 1234] DEBUG "
+                 "(x:1) algo\n[Thu, 05 Nov 2026 10:00:02 virt-install 1234] ERROR "
+                 "(cli:255) Guest name 'alu0000-server1' is already in use.\n")
+        rs = cd.comprobar_orden(self.home, UVUS, "alu0000-server1")
+        self.assertIn("is already in use", texto_de(con_estado(rs, cd.ERROR)))
+        self.assertIn("Thu, 05 Nov 2026 10:00:00", rs[0].texto)
+
+    def test_intento_anterior_en_antes(self):
+        # --antes: espacio tras la coma (visto en avantasia: virt-install no la crea)
+        self.revisar(MANUAL.replace("user-data,meta-data", "user-data, meta-data"))
+        rs = cd.comprobar_intento_anterior(self.home, UVUS, "alu0000-server1")
+        self.assertIn("espacio tras una coma", texto_de(rs))
+
+    def test_intento_anterior_completado(self):
+        escribir(os.path.join(self.home, ".cache", "virt-manager", "virt-install.log"),
+                 LINEA % MANUAL + "[Thu, 05 Nov 2026 10:00:09 virt-install 1234] DEBUG "
+                 "(x:1) Domain creation completed.\n")
+        rs = cd.comprobar_intento_anterior(self.home, UVUS, "alu0000-server1")
+        self.assertEqual([r.estado for r in rs], [cd.OK])
+
+    def test_sin_intento_anterior(self):
+        self.assertEqual(cd.comprobar_intento_anterior(self.home, UVUS, "alu0000-server1"), [])
+
     def test_sin_registro(self):
         rs = cd.comprobar_orden(self.home, UVUS, "alu0000-server1")
         self.assertEqual(rs[0].estado, cd.OMITIDA)

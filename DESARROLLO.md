@@ -87,6 +87,9 @@ tienen que probarse como los verá un alumno.
   mensajes de `ssh` desde el primer segundo (D1) y comprueba `ci-diagnosis` con
   la máquina encendida y, apagada, leyendo su disco. Tarda de 10 a 15 minutos y
   elimina la máquina y su disco al terminar.
+- **Fase c:** B8 (home cerrado y `virt-install`), C2 (nombre y disco en uso),
+  B10 (`ssh` con la clave en `644`) y el registro de `virt-install` tras un
+  error (C1). Unos 5 minutos; usa `<usuario>-server1` y `<usuario>-server2`.
 
 El registro completo queda en `/tmp/pruebas-ci-diagnosis-<usuario>-<fecha>.log`.
 
