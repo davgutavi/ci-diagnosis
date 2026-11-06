@@ -88,9 +88,12 @@ chmod 644 "$LOG"
 # ---------------------------------------------------------------------------
 # Utilidades
 # ---------------------------------------------------------------------------
-# Claves de usar y tirar, sin frase de paso salvo que se indique
+# Claves de usar y tirar, sin frase de paso salvo que se indique. Se borra
+# antes la anterior: al sobrescribir, ssh-keygen conserva los permisos que
+# tuviera el archivo (visto el 6-nov: una id_rsa en 644 seguía en 644)
 clave() {   # RUTA COMENTARIO [FRASE]
-    ssh-keygen -q -t rsa -b 2048 -N "${3:-}" -C "$2" -f "$1" <<< y >/dev/null 2>&1
+    rm -f "$1" "$1.pub"
+    ssh-keygen -q -t rsa -b 2048 -N "${3:-}" -C "$2" -f "$1" </dev/null >/dev/null 2>&1
 }
 
 # La cuenta de prueba necesita su pareja de claves (como la del manual, 5.4.1)
@@ -283,8 +286,10 @@ FIN
 
     titulo "A.4 Disco (B3)"
     info "qemu-img create sin -F (mensaje real):"
-    (cd "$SILO" && rm -f server1.qcow2 \
-        && qemu-img create server1.qcow2 -f qcow2 -b "$BASE" 40G 2>&1) | tee -a "$LOG" | sed 's/^/       | /'
+    (cd "$SILO" && rm -f server1.qcow2
+     qemu-img create server1.qcow2 -f qcow2 -b "$BASE" 40G 2>&1; echo "[código $?]"
+     if [[ -f server1.qcow2 ]]; then echo "[server1.qcow2 creado]"; qemu-img info -U server1.qcow2
+     else echo "[server1.qcow2 no se ha creado]"; fi) | tee -a "$LOG" | sed 's/^/       | /'
     caso "disco de 20G" 'no 40 GiB' <<'FIN'
 rm -f server1.qcow2 && qemu-img create -q server1.qcow2 -f qcow2 -b noble-server-cloudimg-amd64.img -F qcow2 20G
 FIN
