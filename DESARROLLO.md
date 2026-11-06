@@ -13,6 +13,8 @@ src/base.py       Importaciones, resultados, salida y ejecutar() (órdenes exter
 src/textos.py     Secciones del manual y valores que espera el manual
 src/claves.py     ~/.ssh/id_rsa e id_rsa.pub, agente (B7, B10, D6)
 src/archivos.py   user-data, meta-data y network-config (B1, B4, B5, B6)
+src/servidor.py   libvirt (solo lectura): silos, red, imagen y disco, nombres y
+                  permisos (A1, A2, A3, B2, B3, B8, B9, C1, C2, D5)
 src/main.py       Opciones y flujo principal
 ```
 
@@ -29,7 +31,10 @@ comprueba que `ci-diagnosis` está al día respecto a los fuentes.
 
 ## Tests locales (sin libvirt)
 
-Con `unittest`, sobre el programa generado (que es lo que usa el alumnado). Las
+Con `unittest`, sobre el programa generado (que es lo que usa el alumnado), con
+un libvirt simulado (`tests/falso_libvirt.py`) que solo tiene los métodos de
+lectura: cualquier otro, o abrir una conexión de escritura, hace fallar el test.
+Las imágenes se crean con el `qemu-img` de verdad (en macOS: `brew install qemu`). Las
 claves SSH se generan al vuelo con `ssh-keygen` y el alumno de prueba es
 `alu0000`: el repositorio es público, así que **ningún test ni ejemplo puede
 llevar un UVUS real**.
@@ -53,7 +58,8 @@ no da acceso a nada).
 
 ## Lo que conviene saber antes de tocar el código
 
-- **Solo lee.** Las órdenes externas pasan todas por `ejecutar()`, que solo
+- **Solo lee.** La conexión a libvirt es `openReadOnly("qemu:///system")`: libvirt
+  rechaza cualquier cambio. Las órdenes externas pasan todas por `ejecutar()`, que solo
   admite las de `ORDENES_PERMITIDAS` y las lanza sin teclado y con `LC_ALL=C`
   (warcry y megadeth responden en español). Los tests de `test_build.py`
   revisan el código: nada de `os.remove`, `os.chmod`… ni `open` para escribir,
@@ -68,6 +74,12 @@ no da acceso a nada).
 - **Mensajes del sistema.** Los que se citan en los textos tienen que estar
   grabados en el servidor (por ejemplo, `Permission denied (publickey)`). Si
   no lo están, se describe el efecto sin citar.
+- **Silos por trayecto.** Los nombres de los silos no identifican al dueño
+  (hay erratas y variantes): todo se decide por el trayecto real (`realpath`).
+- **Permisos, no dueños.** libvirt cambia el dueño de la imagen base y del disco
+  al encender la máquina (`libvirt-qemu kvm`), pero no los permisos; al
+  apagarla, el disco vuelve al alumno y la imagen base no. Por eso se avisa
+  por los permisos, sea quien sea el dueño.
 - **El manual.** Todas las referencias van por `SECCIONES` (`textos.py`): si
   cambia la numeración, se cambia solo esa tabla.
 - **«Cómo arreglarlo»** es un campo aparte (`arreglo`): con

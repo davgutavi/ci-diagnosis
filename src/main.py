@@ -73,12 +73,9 @@ def normalizar_maquina(nombre, uvus):
     return nombre
 
 
-def diagnosticar_antes(uvus, home, directorio, maquina, red=None):
-    """Comprobaciones antes de virt-install. Devuelve (informe, máquina)."""
-    informe = Informe()
-    res_claves, clave = comprobar_claves(home)
-
-    res = []
+def diagnosticar_archivos(uvus, directorio, maquina, clave, red):
+    """Los tres archivos de cloud-init. Devuelve (resultados, máquina, IP)."""
+    res, ip = [], None
     for nombre, (r, datos) in comprobar_nombres(directorio).items():
         res += r
         if datos is None:
@@ -95,10 +92,37 @@ def diagnosticar_antes(uvus, home, directorio, maquina, red=None):
             if maquina is None and isinstance(meta, dict) and meta.get("local-hostname"):
                 maquina = str(meta["local-hostname"])
         else:
-            res += comprobar_network_config(texto, red)[0]
-    informe.bloque("Archivos de cloud-init", res)
+            r, ip = comprobar_network_config(texto, red)
+            res += r
+    return res, maquina, ip
+
+
+def diagnosticar_antes(uvus, home, directorio, maquina, conn=None):
+    """Comprobaciones antes de virt-install.
+
+    Sin conexión (conn=None) solo se revisan los archivos y las claves: lo usan
+    los tests de esas partes. Devuelve (informe, máquina, existe la máquina).
+    """
+    informe = Informe()
+    res_claves, clave = comprobar_claves(home)
+    red, existe = None, False
+    if conn is not None:
+        silos = leer_silos(conn)
+        informe.bloque("Entorno compartido", comprobar_entorno_compartido(silos, home))
+        informe.bloque("Directorio y silo", comprobar_silo(silos, uvus, home, directorio))
+        res_red, red = comprobar_red(conn, uvus)
+        informe.bloque("Red", res_red)
+    res_archivos, maquina, ip = diagnosticar_archivos(uvus, directorio, maquina, clave, red)
+    if conn is not None:
+        informe.bloque("Imagen y disco", comprobar_imagen_y_disco(directorio, maquina))
+    informe.bloque("Archivos de cloud-init", res_archivos)
     informe.bloque("Claves SSH", res_claves)
-    return informe, maquina
+    if conn is not None:
+        res_nombres, existe = comprobar_nombres_libres(conn, uvus, home, directorio,
+                                                       maquina, ip, red)
+        informe.bloque("Nombres libres", res_nombres)
+        informe.bloque("Permisos", comprobar_permisos(directorio))
+    return informe, maquina, existe
 
 
 def main(argv=None):
@@ -131,14 +155,29 @@ def main(argv=None):
     home = os.path.expanduser("~")
     directorio = os.getcwd()
     maquina = normalizar_maquina(opciones["maquina"], uvus)
-    informe, maquina = diagnosticar_antes(uvus, home, directorio, maquina)
+    try:
+        conn = abrir_conexion()
+    except SinLibvirt as e:
+        print("ci-diagnosis: %s." % e, file=sys.stderr)
+        print("Sin libvirt no se puede hacer la revisión: avise al profesor.",
+              file=sys.stderr)
+        return 2
+    try:
+        informe, maquina, existe = diagnosticar_antes(uvus, home, directorio, maquina, conn)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     servidor = os.uname().nodename.split(".")[0]
     print("ci-diagnosis %s · %s · usuario: %s · máquina: %s" % (
         VERSION, servidor, uvus, "%s-%s" % (uvus, maquina) if maquina else "sin determinar"))
     print("Modo: antes de virt-install")
-    print("(Versión en desarrollo: de momento solo revisa los archivos de "
-          "cloud-init y las claves.)")
+    if existe and opciones["modo"] is None:
+        print("(La máquina ya existe. La revisión --acceso, para cuando no puede "
+              "entrar en ella, todavía no está disponible.)")
+    print("(Versión en desarrollo.)")
     print()
     for linea in formatear_informe(informe, usar_color(sys.stdout)):
         print(linea)

@@ -10,8 +10,10 @@ toca silos ni redes y no muestra nunca la clave privada.
 """
 
 import base64
+import grp
 import hashlib
 import ipaddress
+import json
 import os
 import pwd
 import re
@@ -21,6 +23,7 @@ import subprocess
 import sys
 import textwrap
 import unicodedata
+import xml.etree.ElementTree as ET
 
 try:
     import yaml
