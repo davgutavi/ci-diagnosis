@@ -390,8 +390,9 @@ def comprobar_claves(home):
         rs.append(error(
             "~/.ssh/id_rsa tiene permisos %s: puede leerla alguien más" % _modo(st),
             fallo="B10",
-            efecto="ssh se niega a usar una clave privada que pueden leer otros, "
-                   "y la máquina responderá «Permission denied (publickey)».",
+            efecto="ssh y ssh-add la ignoran («WARNING: UNPROTECTED PRIVATE KEY "
+                   "FILE!» … «This private key will be ignored.»), y la máquina "
+                   "responderá «Permission denied (publickey)».",
             arreglo="chmod 600 ~/.ssh/id_rsa", seccion="preliminar"))
     else:
         rs.append(ok("~/.ssh/id_rsa: solo la puede leer usted (%s)" % _modo(st)))
