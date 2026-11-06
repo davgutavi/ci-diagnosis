@@ -128,13 +128,19 @@ class TestOpciones(unittest.TestCase):
             redes=[fl.Red("alu0000-red")],
             dominios=[fl.Dominio("zzz9999-server1", ["/home/zzz9999/server1.qcow2"])])
 
-    def ejecutar_en(self, home, silo, conn, argv=()):
+    def ejecutar_en(self, home, silo, conn, argv=(), puerto="sin ruta", ping=False,
+                    ssh=(255, "", "Permission denied (publickey).\n"), disco=None):
+        """main() en el silo, con libvirt, la red, ssh y guestfish simulados."""
         entorno = {"HOME": home, "CI_DIAGNOSIS_USUARIO": "alu0000"}
         anterior = os.getcwd()
+        disco = disco or ({}, None, cd.error("guestfish simulado: sin disco"))
         try:
             os.chdir(silo)
             with mock.patch.dict(os.environ, entorno), fl.instalado(conn), \
-                    mock.patch.object(cd, "responde_ping", return_value=False):
+                    mock.patch.object(cd, "responde_ping", return_value=ping), \
+                    mock.patch.object(cd, "probar_puerto", return_value=puerto), \
+                    mock.patch.object(cd, "_ssh", return_value=ssh), \
+                    mock.patch.object(cd, "leer_disco", return_value=disco):
                 return self.ejecutar_main(list(argv))
         finally:
             os.chdir(anterior)
@@ -175,6 +181,75 @@ class TestOpciones(unittest.TestCase):
             codigo, salida, _ = self.ejecutar_en(home, silo, conn, ["server1"])
         self.assertEqual(codigo, 1)
         self.assertIn("La máquina ya existe", salida)
+        self.assertIn("(--acceso)", salida)
+
+    def con_maquina(self, home, **kw):
+        silo, conn = self.preparar_alumno(home)
+        kw.setdefault("red", "alu0000-red")
+        conn.dominios.append(fl.Dominio("alu0000-server1",
+                                        [os.path.join(silo, "server1.qcow2")], **kw))
+        return silo, conn
+
+    @necesita_yaml
+    def test_acceso_puede_entrar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.realpath(tmp)
+            silo, conn = self.con_maquina(home, activo=True)
+            codigo, salida, _ = self.ejecutar_en(home, silo, conn, puerto="abierto",
+                                                 ping=True, ssh=(0, "", ""))
+        self.assertEqual(codigo, 0, salida)
+        self.assertIn("Modo: no puede entrar en la máquina (--acceso)", salida)
+        self.assertIn("IP 192.168.7.2 (de network-config)", salida)
+        self.assertIn("Puede entrar", salida)
+        self.assertNotIn("DISCO DE LA MÁQUINA", salida)
+
+    @necesita_yaml
+    def test_acceso_encendida_sin_entrar_pide_apagarla(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.realpath(tmp)
+            silo, conn = self.con_maquina(home, activo=True)
+            codigo, salida, _ = self.ejecutar_en(home, silo, conn, puerto="abierto", ping=True)
+        self.assertEqual(codigo, 1)
+        self.assertIn("rechaza su clave", salida)
+        self.assertIn("virsh shutdown alu0000-server1", salida)
+        self.assertIn("ORDEN DE VIRT-INSTALL", salida)
+
+    @necesita_yaml
+    def test_acceso_apagada_lee_el_disco(self):
+        from test_acceso import disco_bueno
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.realpath(tmp)
+            silo, conn = self.con_maquina(home)
+            codigo, salida, _ = self.ejecutar_en(
+                home, silo, conn, disco=(disco_bueno(), ["alu0000-server1"], None))
+        self.assertIn("Disco leído", salida)
+        self.assertIn("La máquina tiene su clave", salida)
+        self.assertIn("la máquina está apagada", salida)
+        self.assertEqual(codigo, 0, salida)
+
+    @necesita_yaml
+    def test_acceso_sin_ip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.realpath(tmp)
+            silo, conn = self.con_maquina(home, activo=True)
+            escribir(os.path.join(silo, "meta-data"),
+                     META_DATA.replace("server1", "server2"))
+            codigo, salida, _ = self.ejecutar_en(home, silo, conn, ["server1"])
+            self.assertIn("Indíquela con --ip", salida)
+            codigo, salida, _ = self.ejecutar_en(home, silo, conn,
+                                                 ["server1", "--ip", "192.168.7.5"],
+                                                 puerto="abierto", ssh=(0, "", ""))
+        self.assertIn("IP 192.168.7.5 (de --ip)", salida)
+        self.assertEqual(codigo, 0, salida)
+
+    def test_acceso_sin_maquina(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.realpath(tmp)
+            silo, conn = self.preparar_alumno(home)
+            os.remove(os.path.join(silo, "meta-data"))
+            codigo, _, errores = self.ejecutar_en(home, silo, conn, ["--acceso"])
+        self.assertEqual(codigo, 2)
+        self.assertIn("indique qué máquina", errores)
 
     def test_sin_libvirt(self):
         with mock.patch.dict("sys.modules", {"libvirt": None}):
