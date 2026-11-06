@@ -317,6 +317,17 @@ class TestComprobarDisco(unittest.TestCase):
         self.assertEqual(len(d2), 1)
         self.assertIn("primer arranque", d2[0].efecto)
 
+    def test_mismo_disco_con_user_data_corregido(self):
+        # D2 visto en avantasia (6-nov): cloud-init guarda el user-data nuevo,
+        # pero la clave instalada sigue siendo la del primer arranque
+        rs = self.revisar(disco_bueno(**{"/home/administrador/.ssh/authorized_keys":
+                                         Claves.publica("portatil") + "\n"}),
+                          actual=USER_DATA.format(clave=Claves.publica("sin_frase")),
+                          iid="alu0000-server1")
+        errores = con_estado(rs, cd.ERROR)
+        self.assertEqual([r.fallo for r in errores], ["D2"])
+        self.assertIn("alu0000@portatil", texto_de(errores))
+
     def test_user_data_aplicado_con_fallos(self):
         aplicado = USER_DATA.format(clave=Claves.publica("portatil")).replace(
             "#cloud-config\n", "")
@@ -330,8 +341,11 @@ class TestComprobarDisco(unittest.TestCase):
         self.assertIn("no tiene authorized_keys", con_estado(rs, cd.ERROR)[0].texto)
 
     def test_otra_clave_en_la_maquina(self):
-        rs = self.revisar(disco_bueno(**{"/home/administrador/.ssh/authorized_keys":
-                                         Claves.publica("portatil") + "\n"}))
+        # B5: el user-data ya llevaba la clave del portátil
+        portatil = Claves.publica("portatil")
+        rs = self.revisar(disco_bueno(**{
+            "/home/administrador/.ssh/authorized_keys": portatil + "\n",
+            "/var/lib/cloud/instance/user-data.txt": USER_DATA.format(clave=portatil)}))
         mal = con_estado(rs, cd.ERROR)[0]
         self.assertEqual(mal.fallo, "B5")
         self.assertIn("alu0000@portatil", texto_de([mal]))

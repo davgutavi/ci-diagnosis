@@ -579,8 +579,8 @@ fase_b() {
     esperar_ssh "$HOME/.ssh/id_rsa" 180
     esperar_cloud_init
     apagar_vm
-    diag_disco "apagada: el user-data aplicado no es el de ahora (D2)" \
-        'no es el que tiene ahora en el silo \[D2\]'
+    diag_disco "apagada: cloud-init no volvió a aplicar user-data (D2)" \
+        'no ha vuelto a aplicar user-data a este disco \[D2\]'
     eliminar_vm
 
     titulo "B.8 Frase de paso, sin y con agente (D6), con un HOME aparte"

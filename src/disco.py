@@ -74,6 +74,24 @@ def leer_disco(disco):
     return archivos, instancias, None
 
 
+def claves_de_user_data(texto):
+    """Las claves de administrador en un user-data (vacío si no se puede leer)."""
+    if yaml is None:
+        return []
+    try:
+        datos = yaml.safe_load(texto)
+    except yaml.YAMLError:
+        return []
+    claves = []
+    for u in (datos or {}).get("users") or [] if isinstance(datos, dict) else []:
+        if isinstance(u, dict) and u.get("name") == USUARIO_VM:
+            for k in _como_lista(u.get("ssh_authorized_keys") or u.get("ssh-authorized-keys")):
+                c = analizar_clave_publica(str(k))
+                if c is not None:
+                    claves.append(c)
+    return claves
+
+
 def _con_prefijo(resultados, prefijo):
     """Los resultados de una comprobación, referidos a lo que hay en la máquina."""
     for r in resultados:
@@ -166,11 +184,27 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
         else:
             instaladas = [c for c in (analizar_clave_publica(l) for l in texto.splitlines()
                                       if l.strip() and not l.startswith("#")) if c]
+            en_aplicado = clave is not None and aplicado is not None and any(
+                c.blob == clave.blob for c in claves_de_user_data(aplicado))
             if clave is None:
                 rs.append(omitida("Clave de la máquina: no hay ~/.ssh/id_rsa.pub con la que "
                                   "compararla"))
             elif any(c.blob == clave.blob for c in instaladas):
                 rs.append(ok("La máquina tiene su clave de ~/.ssh/id_rsa.pub"))
+            elif en_aplicado:
+                # Visto en avantasia (6-nov): con el mismo instance-id, cloud-init
+                # guarda el user-data nuevo pero no vuelve a instalar las claves
+                rs.append(error(
+                    "cloud-init no ha vuelto a aplicar user-data a este disco", fallo="D2",
+                    detalle=["El user-data que tiene la máquina ya lleva su clave, pero "
+                             "la que está instalada es otra:"]
+                    + ["En la máquina: %s" % c.describir() for c in instaladas],
+                    efecto="el disco ya se configuró una vez con este instance-id: corregir "
+                           "user-data y crear la máquina con el mismo disco no cambia nada. "
+                           "ssh seguirá respondiendo «Permission denied (publickey)».",
+                    arreglo="elimine la máquina y su disco, y créela de nuevo desde el "
+                            "primer paso de la 5.4.2, con un disco nuevo.",
+                    seccion=sec))
             else:
                 rs.append(error(
                     "La clave que tiene la máquina no es la de ~/.ssh/id_rsa.pub", fallo="B5",
