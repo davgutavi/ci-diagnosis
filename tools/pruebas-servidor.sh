@@ -15,6 +15,10 @@
 #       primeros segundos, virt-install) y comprueba que ci-diagnosis lo detecta,
 #       con la máquina encendida y, apagada, leyendo su disco. Tarda de 10 a 15
 #       minutos. Al terminar elimina la máquina y su disco.
+#   c   B8, C2, B10 y C1 con máquinas de verdad: el home cerrado, el nombre y el
+#       disco en uso, la clave privada con permisos abiertos y el registro de
+#       virt-install tras un error. Unos 5 minutos. Usa <usuario>-server1 y
+#       <usuario>-server2, y las elimina al terminar.
 #
 # Variables:
 #   CI_DIAGNOSIS=RUTA   el programa que se prueba (por defecto, ci-diagnosis en
@@ -72,6 +76,8 @@ AGENTE_PID=""
 
 limpiar() {
     eliminar_vm 2>/dev/null
+    VM="$USUARIO-server2" eliminar_vm 2>/dev/null
+    [[ -f "$HOME/.ssh/id_rsa" ]] && chmod 600 "$HOME/.ssh/id_rsa"
     chmod "$MODO_HOME" "$HOME"
     [[ -f "$T/$BASE" && ! -f "$SILO/$BASE" ]] && mv "$T/$BASE" "$SILO/$BASE"
     [[ -n "$AGENTE_PID" ]] && kill "$AGENTE_PID" 2>/dev/null
@@ -382,7 +388,7 @@ eliminar_vm() {
         virsh -q destroy "$VM" >/dev/null 2>&1
         virsh -q undefine "$VM" >/dev/null 2>&1
     fi
-    rm -f "$SILO/server1.qcow2"
+    rm -f "$SILO/${VM#"$USUARIO"-}.qcow2"
 }
 
 # crear_vm [ESPECIFICACIÓN DE --cloud-init]: la orden del manual (5.4.2), desde el silo
@@ -609,10 +615,104 @@ fase_b() {
     eliminar_vm
 }
 
+# ---------------------------------------------------------------------------
+# Fase C: B8, C2, B10 y el registro de virt-install
+# ---------------------------------------------------------------------------
+# virt_install NOMBRE DISCO: la orden del manual, mostrando su salida y su código
+virt_install() {
+    (cd "$SILO" && virt-install --name="$1" --cloud-init "$CI_SPEC" --ram=2048 --vcpus=2 \
+        --import --disk path="$2" --os-variant=ubuntu24.04 --network network="$USUARIO-red" \
+        --noautoconsole 2>&1; echo "[código $?]") | tee -a "$LOG" | sed 's/^/       | /'
+}
+
+# Las líneas del registro de virt-install desde la última orden
+registro_virt_install() {
+    local r="$HOME/.cache/virt-manager/virt-install.log"
+    [[ -f "$r" ]] || { info "no hay $r"; return; }
+    awk '/Launched with command line/ { n = NR } { l[NR] = $0 } END { for (i = n; i <= NR; i++) print l[i] }' "$r" \
+        | cut -c1-250 | tee -a "$LOG" | sed 's/^/       | /'
+}
+
+fase_c() {
+    for m in "$USUARIO-server1" "$USUARIO-server2"; do
+        virsh -q dominfo "$m" >/dev/null 2>&1 && {
+            echo "Ya existe la máquina $m: elimínala antes (virsh destroy y undefine)." >&2
+            exit 1; }
+    done
+
+    titulo "C.1 Home cerrado (700) y virt-install (B8)"
+    preparar_bien
+    chmod 700 "$HOME"
+    info "virt-install con el home en 700 (mensaje real):"
+    virt_install "$VM" server1.qcow2
+    if virsh -q dominfo "$VM" >/dev/null 2>&1; then
+        sleep 30
+        info "estado a los 30 s: $(virsh -q domstate "$VM" 2>&1)"
+        info "ssh (mensaje real):"
+        esperar_ssh "$HOME/.ssh/id_rsa" 90
+    else
+        info "virt-install no creó la máquina"
+    fi
+    ejecuta "$SILO" server1 --antes
+    espera "ci-diagnosis señala el home cerrado (B8)" 'libvirt-qemu no puede atravesar .*\[B8\]'
+    chmod "$MODO_HOME" "$HOME"
+    eliminar_vm
+
+    titulo "C.2 Nombre en uso (C2)"
+    preparar_bien
+    crear_vm
+    info "virt-install otra vez con el mismo nombre (mensaje real):"
+    (cd "$SILO" && qemu-img create -q otra.qcow2 -f qcow2 -b "$BASE" -F qcow2 40G)
+    virt_install "$VM" otra.qcow2
+    rm -f "$SILO/otra.qcow2"
+    ejecuta "$SILO" server1 --antes
+    espera "ci-diagnosis --antes: ya existe la máquina" "Ya existe la máquina $VM \[C2\]"
+
+    titulo "C.3 Disco en uso por otra máquina encendida (C2)"
+    info "virt-install $USUARIO-server2 con server1.qcow2 (mensaje real):"
+    virt_install "$USUARIO-server2" server1.qcow2
+    if virsh -q dominfo "$USUARIO-server2" >/dev/null 2>&1; then
+        info "virt-install creó $USUARIO-server2 con el disco de la otra"
+        virsh -q destroy "$USUARIO-server2" >/dev/null 2>&1
+        virsh -q undefine "$USUARIO-server2" >/dev/null 2>&1
+    fi
+
+    titulo "C.4 Clave privada con permisos 644 contra la máquina (B10)"
+    esperar_ssh "$HOME/.ssh/id_rsa" 180 >/dev/null
+    esperar_cloud_init
+    chmod 644 "$HOME/.ssh/id_rsa"
+    info "ssh con id_rsa en 644 (mensaje real):"
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        "administrador@$IP_VM" true 2>&1 | tee -a "$LOG" | sed 's/^/       | /'
+    ejecuta "$SILO" server1
+    espera "ci-diagnosis: ssh ignora la clave por sus permisos" 'ssh ignora ~/\.ssh/id_rsa por sus permisos'
+    chmod 600 "$HOME/.ssh/id_rsa"
+    eliminar_vm
+
+    titulo "C.5 El registro de virt-install tras un error (C1)"
+    preparar_bien
+    info "virt-install con un espacio tras la coma:"
+    (cd "$SILO" && virt-install --name="$VM" --cloud-init user-data=user-data, \
+        meta-data=meta-data,network-config=network-config --ram=2048 --vcpus=2 --import \
+        --disk path=server1.qcow2 --os-variant=ubuntu24.04 --network network="$USUARIO-red" \
+        --noautoconsole >/dev/null 2>&1)
+    info "lo que queda en el registro:"
+    registro_virt_install
+    ejecuta "$SILO" server1 --antes
+    espera "ci-diagnosis --antes: el último virt-install tenía un espacio tras la coma" \
+        'espacio tras una coma'
+    eliminar_vm
+    info "y tras una creación correcta, el registro:"
+    crear_vm
+    registro_virt_install
+    eliminar_vm
+}
+
 case "$FASE" in
     a) fase_a ;;
     b) fase_b ;;
-    *) echo "Fase desconocida: $FASE (a o b)" >&2; exit 2 ;;
+    c) fase_c ;;
+    *) echo "Fase desconocida: $FASE (a, b o c)" >&2; exit 2 ;;
 esac
 
 echo

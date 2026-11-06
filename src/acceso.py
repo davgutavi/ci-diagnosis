@@ -227,24 +227,51 @@ def comprobar_ssh(ip, home, cifrada, en_agente):
 # --- C1: la orden de virt-install, en su registro --------------------------------
 
 REGISTRO_VIRT_INSTALL = os.path.join(".cache", "virt-manager", "virt-install.log")
-LANZADA_RE = re.compile(r"Launched with command line: (.*)$")
+LANZADA_RE = re.compile(r"^\[([^\]]*?) virt-install \d+\].*Launched with command line: (.*)$")
+# Mismo formato que la línea de la orden (grabada): «[fecha virt-install PID] NIVEL (módulo:línea) mensaje»
+ERROR_RE = re.compile(r"^\[[^\]]*\] ERROR \([^)]*\) (.*)$")
 
 
-def ultima_orden(home, nombre):
-    """La última orden de virt-install para esa máquina (lista de palabras)."""
+class Intento:
+    """Una ejecución de virt-install en su registro."""
+
+    def __init__(self, fecha, palabras):
+        self.fecha, self.palabras = fecha, palabras
+        self.errores, self.completado = [], False
+
+
+def ultimo_intento(home, nombre):
+    """La última ejecución de virt-install para esa máquina, o None."""
     base = os.path.join(home, REGISTRO_VIRT_INSTALL)
     for ruta in [base] + ["%s.%d" % (base, i) for i in range(1, 6)]:
         datos = leer_bytes(ruta)
         if datos is None:
             continue
-        encontrada = None
+        encontrado, actual = None, None
         for linea in datos.decode("utf-8", "replace").splitlines():
             m = LANZADA_RE.search(linea)
-            if m and nombre in _nombre_en(m.group(1).split()):
-                encontrada = m.group(1).split()
-        if encontrada:
-            return encontrada
+            if m:
+                palabras = m.group(2).split()
+                actual = Intento(m.group(1), palabras) if nombre in _nombre_en(palabras) else None
+                if actual is not None:
+                    encontrado = actual
+                continue
+            if actual is None:
+                continue
+            e = ERROR_RE.search(linea)
+            if e:
+                actual.errores.append(e.group(1).strip())
+            elif "Domain creation completed" in linea:
+                actual.completado = True
+        if encontrado:
+            return encontrado
     return None
+
+
+def ultima_orden(home, nombre):
+    """La última orden de virt-install para esa máquina (lista de palabras)."""
+    intento = ultimo_intento(home, nombre)
+    return intento.palabras if intento else None
 
 
 def _nombre_en(palabras):
@@ -266,13 +293,18 @@ def _valor(palabras, opcion):
     return None
 
 
-def comprobar_orden(home, uvus, nombre):
-    palabras = ultima_orden(home, nombre)
-    if palabras is None:
+def comprobar_orden(home, uvus, nombre, intento=None):
+    intento = intento or ultimo_intento(home, nombre)
+    if intento is None:
         return [omitida("Orden de virt-install: no está en su registro "
                         "(~/.cache/virt-manager/virt-install.log)")]
+    palabras = intento.palabras
     rs = []
     sec = "instanciar"
+    if intento.errores:
+        rs.append(error("virt-install terminó con un error (%s)" % intento.fecha,
+                        detalle=["virt-install: %s" % e[:300] for e in intento.errores[:3]],
+                        seccion=sec))
     un_guion = [p for p in palabras[1:] if re.match(r"^-[a-z]{2,}", p)]
     if un_guion:
         rs.append(error("La orden tiene opciones con un solo guion: %s" % " ".join(un_guion),
@@ -307,4 +339,21 @@ def comprobar_orden(home, uvus, nombre):
                         seccion=sec))
     if not rs:
         rs.append(ok("La orden de virt-install es como la del manual"))
+    return rs
+
+
+def comprobar_intento_anterior(home, uvus, nombre):
+    """--antes: si ya hubo un virt-install para esta máquina (que no existe), qué
+    pasó. Lista vacía si no lo hubo."""
+    intento = ultimo_intento(home, nombre)
+    if intento is None:
+        return []
+    if intento.completado and not intento.errores:
+        return [ok("Ya la creó el %s y después la eliminó" % intento.fecha)]
+    rs = comprobar_orden(home, uvus, nombre, intento)
+    if not intento.errores and not [r for r in rs if r.estado in (ERROR, AVISO)]:
+        rs.append(aviso("El último virt-install de %s (%s) no llegó a crear la máquina"
+                        % (nombre, intento.fecha),
+                        efecto="su registro no dice por qué; revise lo que mostró en "
+                               "pantalla.", seccion="instanciar"))
     return rs
