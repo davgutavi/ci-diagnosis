@@ -1,5 +1,6 @@
 # Instrucciones para Claude Code: no van al repositorio
 CLAUDE.md
+.claude/settings.local.json
 
 # Python
 __pycache__/
