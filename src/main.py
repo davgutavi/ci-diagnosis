@@ -208,7 +208,7 @@ def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
             informe.bloque("Conectividad", [ok("IP %s (de %s)" % (ip, origen))] + res_con)
             if abierto:
                 cifrada, en_agente = estado_de_la_clave(home)
-                res_ssh, entra = comprobar_ssh(ip, home, cifrada, en_agente)
+                res_ssh, entra = comprobar_ssh(ip, home, cifrada, en_agente, maquina)
                 informe.bloque("Acceso por SSH", res_ssh)
         if not entra:
             informe.bloque("Disco de la máquina", [omitida(
@@ -235,6 +235,21 @@ def revisar_disco(conn, maquina, clave, directorio, iid, red):
         if d.name() != maquina.nombre and d.isActive() and disco in discos_de(d):
             return [error("El disco lo está usando la máquina encendida %s" % d.name(),
                           fallo="C2", seccion="instanciar")]
+    info, _ = info_imagen(disco)
+    respaldo = (info or {}).get("backing-filename")
+    if respaldo:
+        completo = info.get("full-backing-filename") or os.path.join(
+            os.path.dirname(disco), respaldo)
+        if not os.path.exists(completo):
+            # Visto en avantasia (6-nov): virsh start dice «Cannot access backing
+            # file ... No such file or directory», y guestfish no puede leer el disco
+            return [error("No está la imagen de la que depende el disco de la máquina",
+                          fallo="B3", detalle=["Disco: %s" % disco, "Respaldo: %s" % completo],
+                          efecto="la máquina no puede arrancar («Cannot access backing file "
+                                 "... No such file or directory») y su disco no se puede leer.",
+                          arreglo="devuelva la imagen base a ese sitio, con ese nombre: la "
+                                  "imagen base no se puede mover ni renombrar.",
+                          seccion="instanciar")]
     previo = comprobar_libguestfs()
     if previo is not None and previo.estado == ERROR:
         return [previo]

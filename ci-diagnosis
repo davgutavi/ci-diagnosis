@@ -1871,21 +1871,45 @@ def _ssh(ip, home, known_hosts, estricto):
                 "-o", "StrictHostKeyChecking=%s" % ("yes" if estricto else "no")]
     if not estricto:
         opciones += ["-o", "GlobalKnownHostsFile=/dev/null"]
-    return ejecutar(["ssh", "-n"] + opciones + ["%s@%s" % (USUARIO_VM, ip), "true"],
+    # hostname: para saber en qué máquina ha entrado (D5); solo lee
+    return ejecutar(["ssh", "-n"] + opciones + ["%s@%s" % (USUARIO_VM, ip), "hostname"],
                     timeout=30)
 
 
-def comprobar_ssh(ip, home, cifrada, en_agente):
-    """D4 y D6: primero known_hosts, después el acceso. No escribe en known_hosts.
+def _otra_maquina(salida, esperado):
+    """El hostname de la máquina en la que ha entrado ssh, si no es la esperada."""
+    nombre = (salida or "").strip().splitlines()[-1:] or [""]
+    nombre = nombre[0].strip()
+    if esperado and nombre and nombre != esperado:
+        return nombre
+    return None
 
+
+def _aviso_d5(ip, otra, esperado):
+    return aviso("En %s ha contestado una máquina que se llama %s, no %s" % (ip, otra, esperado),
+                 fallo="D5",
+                 efecto="probablemente otra máquina suya tiene la misma IP; con las dos "
+                        "encendidas, ssh entra unas veces en una y otras en la otra.",
+                 arreglo="dé a cada máquina una IP distinta en su network-config (o "
+                         "apague la otra).", seccion="instanciar")
+
+
+def comprobar_ssh(ip, home, cifrada, en_agente, esperado=None):
+    """D4, D5 y D6: primero known_hosts, después el acceso. No escribe en known_hosts.
+
+    esperado: el hostname de la máquina (serverX); si contesta otra, es D5.
     Devuelve (resultados, ha podido entrar).
     """
     rs = []
     known_hosts = os.path.join(home, ".ssh", "known_hosts")
     codigo, _, _ = ejecutar(["ssh-keygen", "-F", str(ip), "-f", known_hosts])
     conocida = codigo == 0
-    codigo, _, err = _ssh(ip, home, known_hosts if conocida else "/dev/null", conocida)
+    codigo, salida, err = _ssh(ip, home, known_hosts if conocida else "/dev/null", conocida)
     if codigo == 0:
+        otra = _otra_maquina(salida, esperado)
+        if otra:
+            rs.append(_aviso_d5(ip, otra, esperado))
+            return rs, False
         rs.append(ok("Puede entrar: ssh %s@%s funciona" % (USUARIO_VM, ip)))
         return rs, True
     if codigo is None:
@@ -2113,7 +2137,9 @@ def leer_disco(disco):
         return {}, None, error("guestfish no ha terminado a tiempo (o no está instalado)",
                                arreglo="avise al profesor.", seccion="faq-guestfs")
     if MARCA not in salida:
-        ultima = [l for l in err.strip().splitlines() if l.strip()][-1:] or ["(sin mensaje)"]
+        lineas = [l.strip() for l in err.strip().splitlines() if l.strip()]
+        con_error = [l for l in lineas if "error" in l.lower()]
+        ultima = con_error[:1] or lineas[-1:] or ["(sin mensaje)"]
         if "supermin" in err:
             return {}, None, error("libguestfs no funciona en el servidor",
                                    detalle=["guestfish dice: %s" % ultima[0]],
@@ -2510,7 +2536,7 @@ def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
             informe.bloque("Conectividad", [ok("IP %s (de %s)" % (ip, origen))] + res_con)
             if abierto:
                 cifrada, en_agente = estado_de_la_clave(home)
-                res_ssh, entra = comprobar_ssh(ip, home, cifrada, en_agente)
+                res_ssh, entra = comprobar_ssh(ip, home, cifrada, en_agente, maquina)
                 informe.bloque("Acceso por SSH", res_ssh)
         if not entra:
             informe.bloque("Disco de la máquina", [omitida(
@@ -2537,6 +2563,21 @@ def revisar_disco(conn, maquina, clave, directorio, iid, red):
         if d.name() != maquina.nombre and d.isActive() and disco in discos_de(d):
             return [error("El disco lo está usando la máquina encendida %s" % d.name(),
                           fallo="C2", seccion="instanciar")]
+    info, _ = info_imagen(disco)
+    respaldo = (info or {}).get("backing-filename")
+    if respaldo:
+        completo = info.get("full-backing-filename") or os.path.join(
+            os.path.dirname(disco), respaldo)
+        if not os.path.exists(completo):
+            # Visto en avantasia (6-nov): virsh start dice «Cannot access backing
+            # file ... No such file or directory», y guestfish no puede leer el disco
+            return [error("No está la imagen de la que depende el disco de la máquina",
+                          fallo="B3", detalle=["Disco: %s" % disco, "Respaldo: %s" % completo],
+                          efecto="la máquina no puede arrancar («Cannot access backing file "
+                                 "... No such file or directory») y su disco no se puede leer.",
+                          arreglo="devuelva la imagen base a ese sitio, con ese nombre: la "
+                                  "imagen base no se puede mover ni renombrar.",
+                          seccion="instanciar")]
     previo = comprobar_libguestfs()
     if previo is not None and previo.estado == ERROR:
         return [previo]

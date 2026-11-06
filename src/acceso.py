@@ -175,21 +175,45 @@ def _ssh(ip, home, known_hosts, estricto):
                 "-o", "StrictHostKeyChecking=%s" % ("yes" if estricto else "no")]
     if not estricto:
         opciones += ["-o", "GlobalKnownHostsFile=/dev/null"]
-    return ejecutar(["ssh", "-n"] + opciones + ["%s@%s" % (USUARIO_VM, ip), "true"],
+    # hostname: para saber en qué máquina ha entrado (D5); solo lee
+    return ejecutar(["ssh", "-n"] + opciones + ["%s@%s" % (USUARIO_VM, ip), "hostname"],
                     timeout=30)
 
 
-def comprobar_ssh(ip, home, cifrada, en_agente):
-    """D4 y D6: primero known_hosts, después el acceso. No escribe en known_hosts.
+def _otra_maquina(salida, esperado):
+    """El hostname de la máquina en la que ha entrado ssh, si no es la esperada."""
+    nombre = (salida or "").strip().splitlines()[-1:] or [""]
+    nombre = nombre[0].strip()
+    if esperado and nombre and nombre != esperado:
+        return nombre
+    return None
 
+
+def _aviso_d5(ip, otra, esperado):
+    return aviso("En %s ha contestado una máquina que se llama %s, no %s" % (ip, otra, esperado),
+                 fallo="D5",
+                 efecto="probablemente otra máquina suya tiene la misma IP; con las dos "
+                        "encendidas, ssh entra unas veces en una y otras en la otra.",
+                 arreglo="dé a cada máquina una IP distinta en su network-config (o "
+                         "apague la otra).", seccion="instanciar")
+
+
+def comprobar_ssh(ip, home, cifrada, en_agente, esperado=None):
+    """D4, D5 y D6: primero known_hosts, después el acceso. No escribe en known_hosts.
+
+    esperado: el hostname de la máquina (serverX); si contesta otra, es D5.
     Devuelve (resultados, ha podido entrar).
     """
     rs = []
     known_hosts = os.path.join(home, ".ssh", "known_hosts")
     codigo, _, _ = ejecutar(["ssh-keygen", "-F", str(ip), "-f", known_hosts])
     conocida = codigo == 0
-    codigo, _, err = _ssh(ip, home, known_hosts if conocida else "/dev/null", conocida)
+    codigo, salida, err = _ssh(ip, home, known_hosts if conocida else "/dev/null", conocida)
     if codigo == 0:
+        otra = _otra_maquina(salida, esperado)
+        if otra:
+            rs.append(_aviso_d5(ip, otra, esperado))
+            return rs, False
         rs.append(ok("Puede entrar: ssh %s@%s funciona" % (USUARIO_VM, ip)))
         return rs, True
     if codigo is None:
