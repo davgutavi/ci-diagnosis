@@ -793,9 +793,12 @@ FIN
     IP_ESPERA="$IP_LAB" esperar_ssh "$HOME/.ssh/id_rsa" 180 >/dev/null || { ko "no se puede entrar en $LAB"; return; }
     info "esperando a que cloud-init instale libvirt (unos minutos)..."
     en_lab 'cloud-init status --wait' >>"$LOG" 2>&1
-    en_lab 'sudo reboot' >/dev/null 2>&1    # para que valga el grupo libvirt
-    sleep 20
-    IP_ESPERA="$IP_LAB" esperar_ssh "$HOME/.ssh/id_rsa" 180 >/dev/null || { ko "no vuelve tras reiniciar"; return; }
+    # Hay que reiniciarla para que valga el grupo libvirt. Desde dentro no: con la
+    # configuración del primer arranque se apagaría (D3; le pasó a la primera
+    # versión de esta fase). Como dice el manual (5.4.3): apagarla y arrancarla.
+    VM="$LAB" apagar_vm
+    virsh -q start "$LAB" >>"$LOG" 2>&1
+    IP_ESPERA="$IP_LAB" esperar_ssh "$HOME/.ssh/id_rsa" 180 >/dev/null || { ko "no vuelve tras apagarla y arrancarla"; return; }
     scp -q -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         "$CI" "administrador@$IP_LAB:ci-diagnosis"
     info "versiones dentro:"
