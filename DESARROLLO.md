@@ -90,6 +90,10 @@ tienen que probarse como los verá un alumno.
 - **Fase c:** B8 (home cerrado y `virt-install`), C2 (nombre y disco en uso),
   B10 (`ssh` con la clave en `644`) y el registro de `virt-install` tras un
   error (C1). Unos 5 minutos; usa `<usuario>-server1` y `<usuario>-server2`.
+- **Fase d:** A1 y A2, que no se pueden provocar en el servidor sin afectar a
+  otros. Crea `<usuario>-lab` (Ubuntu 22.04, con las mismas versiones de libvirt y
+  `virt-install` que el servidor), instala libvirt dentro y los provoca en ese
+  libvirt, donde no hay alumnos. Descarga la imagen de 22.04 la primera vez.
 
 El registro completo queda en `/tmp/pruebas-ci-diagnosis-<usuario>-<fecha>.log`.
 
