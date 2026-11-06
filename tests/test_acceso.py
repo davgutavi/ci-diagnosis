@@ -101,7 +101,7 @@ class TestSsh(unittest.TestCase):
         self.assertIn("UserKnownHostsFile=/dev/null", orden)
         self.assertIn("UpdateHostKeys=no", orden)
         self.assertIn("BatchMode=yes", orden)
-        self.assertIn("administrador@192.168.7.2 true", orden)
+        self.assertIn("administrador@192.168.7.2 hostname", orden)
         # Nunca contraseñas: no deja «Failed password» en ninguna parte (A4, E4)
         for opcion in ("NumberOfPasswordPrompts=0", "PasswordAuthentication=no",
                        "KbdInteractiveAuthentication=no",
@@ -113,6 +113,22 @@ class TestSsh(unittest.TestCase):
         orden = " ".join(ordenes[0])
         self.assertIn("StrictHostKeyChecking=yes", orden)
         self.assertIn("UserKnownHostsFile=/home/alu0000/.ssh/known_hosts", orden)
+
+    def test_contesta_otra_maquina(self):
+        # D5 visto en avantasia (6-nov): con dos máquinas en la misma IP, ssh entra
+        # unas veces en una y otras en la otra
+        falso = Ssh(False, [(0, "server1\n", "")])
+        with mock.patch.object(cd, "ejecutar", falso):
+            rs, entra = cd.comprobar_ssh(IP, "/home/alu0000", False, False, "server2")
+        self.assertFalse(entra)
+        self.assertEqual([(r.estado, r.fallo) for r in rs], [(cd.AVISO, "D5")])
+        self.assertIn("se llama server1, no server2", rs[0].texto)
+
+    def test_contesta_la_suya(self):
+        falso = Ssh(False, [(0, "server2\n", "")])
+        with mock.patch.object(cd, "ejecutar", falso):
+            _, entra = cd.comprobar_ssh(IP, "/home/alu0000", False, False, "server2")
+        self.assertTrue(entra)
 
     def test_clave_del_host_cambiada(self):
         # D4: el mensaje de la FAQ B.2 (grabado en b2-21.txt)
@@ -301,6 +317,12 @@ class TestLeerDisco(unittest.TestCase):
             1, "", "libguestfs: error: /usr/bin/supermin exited with error status 1.\n")
         self.assertEqual(problema.seccion, "faq-guestfs")
         self.assertIn("avise al profesor", problema.arreglo)
+
+    def test_elige_la_linea_del_error(self):
+        err = ("libguestfs: error: could not create appliance\n"
+               "into a bug report or message to the libguestfs\nmailing list.\n")
+        (_, _, problema), _ = self.leer(1, "", err)
+        self.assertIn("could not create appliance", problema.detalle[0])
 
     def test_disco_bloqueado(self):
         (_, _, problema), _ = self.leer(1, "", 'qemu-img: Failed to get shared "write" lock\n')

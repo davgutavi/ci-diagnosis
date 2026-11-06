@@ -49,7 +49,9 @@ def leer_disco(disco):
         return {}, None, error("guestfish no ha terminado a tiempo (o no está instalado)",
                                arreglo="avise al profesor.", seccion="faq-guestfs")
     if MARCA not in salida:
-        ultima = [l for l in err.strip().splitlines() if l.strip()][-1:] or ["(sin mensaje)"]
+        lineas = [l.strip() for l in err.strip().splitlines() if l.strip()]
+        con_error = [l for l in lineas if "error" in l.lower()]
+        ultima = con_error[:1] or lineas[-1:] or ["(sin mensaje)"]
         if "supermin" in err:
             return {}, None, error("libguestfs no funciona en el servidor",
                                    detalle=["guestfish dice: %s" % ultima[0]],

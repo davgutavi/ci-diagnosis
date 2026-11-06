@@ -255,6 +255,19 @@ class TestOpciones(unittest.TestCase):
         self.assertIn("Connection timed out", salida)
         self.assertNotIn("de otra máquina", salida)
 
+    @necesita_yaml
+    def test_acceso_con_la_imagen_base_movida(self):
+        # B3 visto en avantasia (6-nov): guestfish no podía leer el disco y la
+        # herramienta culpaba a libguestfs
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.realpath(tmp)
+            silo, conn = self.con_maquina(home)
+            os.rename(os.path.join(silo, cd.IMAGEN_BASE), os.path.join(silo, "movida.img"))
+            codigo, salida, _ = self.ejecutar_en(home, silo, conn)
+        self.assertEqual(codigo, 1)
+        self.assertIn("No está la imagen de la que depende el disco", salida)
+        self.assertNotIn("avise al profesor", salida)
+
     def test_acceso_sin_maquina(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = os.path.realpath(tmp)

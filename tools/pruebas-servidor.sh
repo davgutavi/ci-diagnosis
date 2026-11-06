@@ -961,8 +961,9 @@ fase_e() {
     info "virsh start con la imagen base movida (mensaje real):"
     { virsh -q start "$VM" 2>&1; echo "[código $?]"; } | tee -a "$LOG" | sed 's/^/       | /'
     ejecuta "$SILO" server1
-    info "ci-diagnosis --acceso con la máquina apagada y sin imagen base:"
-    grep -E '^  (ERROR|AVISO)|^         ' <<< "$SALIDA" | head -8 | sed 's/^/       | /'
+    espera "ci-diagnosis --acceso: falta la imagen base del disco (B3)" \
+        'No está la imagen de la que depende el disco de la máquina \[B3\]'
+    no_aparece "...y no culpa a libguestfs" 'libguestfs'
     mv "$T/$BASE" "$SILO/$BASE"
     eliminar_vm
 
@@ -990,9 +991,14 @@ fase_e() {
         sleep 2
     done
     info "ARP del servidor para $IP_VM: $(ip neigh show "$IP_VM" 2>&1)"
-    ejecuta "$SILO" server2 --acceso
-    info "ci-diagnosis server2 --acceso:"
-    grep -E '^  (OK|ERROR|AVISO)  ' <<< "$SALIDA" | head -8 | sed 's/^/       | /'
+    local i d5=0
+    for i in 1 2 3 4 5; do
+        ejecuta "$SILO" server2 --acceso --ip "$IP_VM"
+        grep -q '\[D5\]' <<< "$SALIDA" && d5=$(( d5 + 1 ))
+    done
+    info "ci-diagnosis server2 --acceso, cinco veces: avisa de D5 en $d5"
+    (( d5 > 0 )) && ok "ci-diagnosis detecta que contesta otra máquina (D5)" \
+        || ko "ci-diagnosis no detecta D5 en cinco intentos"
     VM="$USUARIO-server2" eliminar_vm
     eliminar_vm
 
