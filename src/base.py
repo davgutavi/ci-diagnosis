@@ -31,7 +31,7 @@ try:
 except ImportError:  # sin PyYAML se omiten las comprobaciones de estructura
     yaml = None
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # Si José Antonio decide que la herramienta solo señale los fallos, basta con
 # poner esto a False: «Cómo arreglarlo» desaparece de toda la salida.

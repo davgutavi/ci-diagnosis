@@ -310,6 +310,21 @@ class TestPermisos(ConHome):
             self.assertEqual(cd.comprobar_permisos(self.silo)[0].estado, cd.OMITIDA)
 
 
+class TestSinMaquina(unittest.TestCase):
+
+    def test_nombres_libres_no_queda_vacio(self):
+        # Sin serverX y sin meta-data: no se sabe qué máquina es
+        with tempfile.TemporaryDirectory() as home:
+            silo = os.path.join(home, "imagenesMV")
+            os.mkdir(silo)
+            conn = fl.Conexion(silos=[fl.Silo(UVUS + "-imagenesMV", silo)])
+            informe, maquina, existe = cd.diagnosticar_antes(UVUS, home, silo, None, conn)
+        self.assertIsNone(maquina)
+        nombres = dict(informe.bloques)["Nombres libres"]
+        self.assertEqual([r.estado for r in nombres], [cd.OMITIDA])
+        self.assertIn("server1", nombres[0].texto)
+
+
 class TestConexion(unittest.TestCase):
 
     def test_solo_lectura(self):
