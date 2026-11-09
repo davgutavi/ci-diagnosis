@@ -46,10 +46,17 @@ Según la situación, hace una de dos revisiones:
   `network-config`, sus claves SSH, que el nombre y la IP estén libres, los
   permisos de su directorio personal y, si ya intentó crear la máquina, qué dijo
   `virt-install`.
-- **Cuando no puede entrar** (la máquina ya existe): su estado, si responde en
-  su IP, si `ssh` puede entrar y por qué no, y, con la máquina apagada, lo que
-  cloud-init dejó escrito en su disco: el usuario, la clave y la red que
-  configuró, y sus errores.
+- **Con la máquina ya creada**, en cinco bloques:
+  1. **Máquina y red:** si está encendida, si está conectada a su red, cómo
+     es su red, su IP y si responde en ella (ping y puerto 22).
+  2. **Disco:** su formato, su tamaño y la imagen de la que depende y, con la
+     máquina apagada, lo que cloud-init dejó escrito en él: el usuario, la
+     clave y la red que configuró, y sus errores.
+  3. **Claves SSH y acceso:** sus claves y si `ssh` puede entrar, y por qué no.
+  4. **Orden de virt-install:** la orden con la que creó la máquina, tal como
+     la escribió (la toma de su registro), comparada opción por opción con la
+     del manual.
+  5. **Archivos de cloud-init:** `user-data`, `meta-data` y `network-config`.
 
 Elige sola: si la máquina existe, la segunda; si no, la primera. Puede forzarla
 con `--antes` o con `--acceso`.
@@ -87,7 +94,11 @@ Cada comprobación da una de estas respuestas:
 | `--` | No se ha podido comprobar, porque falla algo de lo que depende. |
 
 Los avisos y errores llevan, debajo, el efecto, cómo arreglarlo y la sección del
-manual. Algunos llevan también, entre corchetes, el código del fallo (`[B5]`):
+manual. Las soluciones llevan sus nombres reales (su UVUS, su máquina, su IP) y
+las órdenes completas, cada una en su línea, listas para copiar. Cuando la única
+solución es volver a crear la máquina, se dan todos los pasos: eliminarla con su
+disco, crear un disco nuevo, la orden de `virt-install` del manual y olvidar la
+huella antigua de `ssh`. Algunos llevan también, entre corchetes, el código del fallo (`[B5]`):
 indíquelo si pregunta en el chat de dudas.
 
 Empiece siempre por el **primer ERROR**: los demás pueden ser consecuencia suya.

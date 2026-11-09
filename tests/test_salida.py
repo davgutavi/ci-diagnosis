@@ -58,6 +58,53 @@ class TestFormato(unittest.TestCase):
         self.assertEqual(informe.codigo_salida(), 1)
         self.assertIn("1 ERROR, 1 AVISO", cd.formatear_informe(informe)[-1])
 
+    def test_arreglo_por_pasos(self):
+        orden = "virt-install " + " ".join(["--opcion=valor"] * 20)
+        r = cd.error("Mal", arreglo=["1. Haga esto:", "$ " + orden, "2. Y esto."])
+        lineas = cd.formatear_resultado(r)
+        self.assertEqual(lineas[1], " " * 9 + "Cómo arreglarlo:")
+        # La orden, entera en una línea (para copiarla), aunque pase del ancho
+        self.assertIn(" " * 14 + orden, lineas)
+        self.assertEqual(cd.texto_del_arreglo(r.arreglo),
+                         "1. Haga esto:\n%s\n2. Y esto." % orden)
+
+    def test_ok_con_detalle(self):
+        r = cd.ok("La orden que ejecutó:", detalle=["virt-install --name=x"])
+        self.assertEqual(cd.formatear_resultado(r)[1], " " * 9 + "virt-install --name=x")
+
+    def test_pasos_con_los_nombres_del_alumno(self):
+        with mock.patch.dict(cd.CONTEXTO, {"uvus": "alu0000", "maquina": "server2",
+                                           "ip": "192.168.7.3"}, clear=True):
+            pasos = cd.pasos_rehacer("Corrija user-data.")
+        self.assertEqual(pasos[1], "1. Corrija user-data.")
+        self.assertIn("$ virsh destroy alu0000-server2", pasos)
+        self.assertIn("$ qemu-img create server2.qcow2 -f qcow2 -b %s -F qcow2 40G"
+                      % cd.IMAGEN_BASE, pasos)
+        self.assertIn("$ ssh-keygen -R 192.168.7.3", pasos)
+        self.assertIn("$ " + cd.orden_virt_install("alu0000", "server2"), pasos)
+        with mock.patch.dict(cd.CONTEXTO, {}, clear=True):
+            self.assertIn("$ virsh destroy <uvus>-serverX", cd.pasos_rehacer())
+
+    def test_pasos_enteros_una_sola_vez(self):
+        rs = [cd.error("Primero", arreglo=cd.pasos_rehacer()),
+              cd.error("Segundo", arreglo=cd.pasos_rehacer("Corrija network-config.")),
+              cd.error("Tercero", arreglo=cd.pasos_rehacer())]
+        cd.compactar_rehacer(rs)
+        self.assertIsInstance(rs[0].arreglo, cd.PasosRehacer)
+        self.assertTrue(rs[1].arreglo.startswith("Corrija network-config. Después, vuelva"))
+        self.assertIn("«Primero»", rs[1].arreglo)
+        self.assertTrue(rs[2].arreglo.startswith("Vuelva a crear"))
+
+    def test_todos_los_errores_y_avisos_dicen_como_arreglarlo(self):
+        import ast
+        sin = []
+        for nodo in ast.walk(ast.parse(leer(SCRIPT))):
+            if (isinstance(nodo, ast.Call) and isinstance(nodo.func, ast.Name)
+                    and nodo.func.id in ("error", "aviso")
+                    and "arreglo" not in {k.arg for k in nodo.keywords}):
+                sin.append(nodo.lineno)
+        self.assertEqual(sin, [], "error() o aviso() sin arreglo en las líneas %s" % sin)
+
     def test_omitida_no_cuenta(self):
         informe = cd.Informe()
         informe.bloque("Uno", [cd.omitida("d")])
@@ -198,10 +245,15 @@ class TestOpciones(unittest.TestCase):
             codigo, salida, _ = self.ejecutar_en(home, silo, conn, puerto="abierto",
                                                  ping=True, ssh=(0, "", ""))
         self.assertEqual(codigo, 0, salida)
-        self.assertIn("Modo: no puede entrar en la máquina (--acceso)", salida)
+        self.assertIn("Modo: revisión de la máquina ya creada (--acceso)", salida)
         self.assertIn("IP 192.168.7.2 (de network-config)", salida)
         self.assertIn("Puede entrar", salida)
-        self.assertNotIn("DISCO DE LA MÁQUINA", salida)
+        self.assertIn("no hace falta revisarlo, puede entrar", salida)
+        # Los cinco bloques, en este orden, también cuando puede entrar
+        bloques = [l for l in salida.splitlines() if re.match(r"^\d\. ", l)]
+        self.assertEqual(bloques, ["1. MÁQUINA Y RED", "2. DISCO", "3. CLAVES SSH Y ACCESO",
+                                   "4. ORDEN DE VIRT-INSTALL",
+                                   "5. ARCHIVOS DE CLOUD-INIT (EN EL SILO)"])
 
     @necesita_yaml
     def test_acceso_encendida_sin_entrar_pide_apagarla(self):
@@ -222,7 +274,7 @@ class TestOpciones(unittest.TestCase):
             silo, conn = self.con_maquina(home)
             codigo, salida, _ = self.ejecutar_en(
                 home, silo, conn, disco=(disco_bueno(), ["alu0000-server1"], None))
-        self.assertIn("Disco leído", salida)
+        self.assertIn("disco leído", salida)
         self.assertIn("La máquina tiene su clave", salida)
         self.assertIn("la máquina está apagada", salida)
         self.assertEqual(codigo, 0, salida)

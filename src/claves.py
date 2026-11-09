@@ -161,8 +161,13 @@ def comprobar_claves(home):
             "No existe ~/.ssh/id_rsa", fallo="B7",
             efecto="ssh no tiene con qué entrar en las máquinas: "
                    "«Permission denied (publickey)».",
-            arreglo="si la borró, genere una pareja nueva («ssh-keygen -t rsa») y "
-                    "rehaga user-data y las máquinas creadas con la anterior.",
+            arreglo=["Si la borró, aparte la pública que queda y genere una pareja "
+                     "nueva (acepte el nombre que propone):",
+                     "$ mv ~/.ssh/id_rsa.pub ~/.ssh/id_rsa.pub.vieja",
+                     "$ ssh-keygen -t rsa",
+                     "Después ponga la nueva ~/.ssh/id_rsa.pub en user-data y vuelva a "
+                     "crear las máquinas que ya tenga: las anteriores solo aceptan la "
+                     "clave que se perdió."],
             seccion="faq-publickey"))
         return rs, publica
 
@@ -187,6 +192,15 @@ def comprobar_claves(home):
 
     if formato is None:
         rs.append(error("~/.ssh/id_rsa no parece una clave privada", fallo="B7",
+                        efecto="ssh no tiene con qué entrar en las máquinas: "
+                               "«Permission denied (publickey)».",
+                        arreglo=["Apártela y genere una pareja nueva (acepte el nombre "
+                                 "que propone):",
+                                 "$ mv ~/.ssh/id_rsa ~/.ssh/id_rsa.mala",
+                                 "$ mv ~/.ssh/id_rsa.pub ~/.ssh/id_rsa.pub.mala",
+                                 "$ ssh-keygen -t rsa",
+                                 "Después ponga la nueva ~/.ssh/id_rsa.pub en user-data y "
+                                 "vuelva a crear las máquinas que ya tenga."],
                         seccion="preliminar"))
         return rs, publica
     if formato == "pem" and cifrada is False:

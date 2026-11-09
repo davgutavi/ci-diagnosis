@@ -334,7 +334,7 @@ FIN
     preparar_bien
     mv "$SILO/$BASE" "$T/$BASE"
     ejecuta "$SILO" server1
-    espera "imagen base movida" 'No está la imagen de la que depende server1\.qcow2'
+    espera "imagen base movida" 'No está la imagen de la que depende el disco server1\.qcow2'
     mv "$T/$BASE" "$SILO/$BASE"
 
     titulo "A.5 Directorio y permisos (B2, B8)"
@@ -511,7 +511,7 @@ fase_b() {
     ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new "administrador@$IP_VM" true \
         >>"$LOG" 2>&1
     apagar_vm
-    diag_disco "apagada: lee el disco con libguestfs" 'Disco leído'
+    diag_disco "apagada: lee el disco con libguestfs" 'disco leído'
     espera "...y la clave de la máquina es la suya" 'La máquina tiene su clave'
     espera "...y cloud-init no dejó errores" 'cloud-init terminó sin errores'
 
@@ -962,7 +962,7 @@ fase_e() {
     { virsh -q start "$VM" 2>&1; echo "[código $?]"; } | tee -a "$LOG" | sed 's/^/       | /'
     ejecuta "$SILO" server1
     espera "ci-diagnosis --acceso: falta la imagen base del disco (B3)" \
-        'No está la imagen de la que depende el disco de la máquina \[B3\]'
+        'No está la imagen de la que depende el disco server1\.qcow2 \[B3\]'
     no_aparece "...y no culpa a libguestfs" 'libguestfs'
     mv "$T/$BASE" "$SILO/$BASE"
     eliminar_vm

@@ -10,13 +10,16 @@ mano. El código vive en `src/`, en fragmentos de un único programa:
 
 ```
 src/base.py       Importaciones, resultados, salida y ejecutar() (órdenes externas)
-src/textos.py     Secciones del manual y valores que espera el manual
+src/textos.py     Secciones del manual, valores que espera el manual, la orden de
+                  virt-install del manual y los pasos para volver a crear la
+                  máquina (con los nombres del alumno, de CONTEXTO)
 src/claves.py     ~/.ssh/id_rsa e id_rsa.pub, agente (B7, B10, D6)
 src/archivos.py   user-data, meta-data y network-config (B1, B4, B5, B6)
 src/servidor.py   libvirt (solo lectura): silos, red, imagen y disco, nombres y
                   permisos (A1, A2, A3, B2, B3, B8, B9, C1, C2, D5)
 src/acceso.py     --acceso: estado de la máquina, conectividad, SSH y la orden
-                  de virt-install en su registro (C1, D1, D3, D4, D6)
+                  de virt-install en su registro, que se muestra y se compara
+                  opción por opción con la del manual (C1, D1, D3, D4, D6)
 src/disco.py      --acceso con la máquina apagada: su disco, con guestfish --ro
                   (B4, B5, B6, D2)
 src/main.py       Opciones y flujo principal
@@ -150,7 +153,18 @@ la cuenta de prueba está activo y haría fallar `virt-install` a todos (A1).
 - **El manual.** Todas las referencias van por `SECCIONES` (`textos.py`): si
   cambia la numeración, se cambia solo esa tabla.
 - **«Cómo arreglarlo»** es un campo aparte (`arreglo`): con
-  `MOSTRAR_ARREGLO = False` la herramienta solo señala los fallos.
+  `MOSTRAR_ARREGLO = False` la herramienta solo señala los fallos. **Todo
+  ERROR y todo AVISO lleva arreglo** (un test lo comprueba). Puede ser un texto
+  o una lista de pasos; en la lista, los pasos que empiezan por `$ ` son órdenes
+  y se muestran enteras en una línea, sin partir, para que se puedan copiar.
+  Las soluciones usan los nombres reales del alumno: `main` rellena `CONTEXTO`
+  (UVUS, máquina, IP) y `pasos_rehacer()`, `orden_virt_install()` y
+  `orden_crear_disco()` los toman de ahí. Cuando hay que volver a crear la
+  máquina, `pasos_rehacer()` da todos los pasos; `compactar_rehacer()` los deja
+  enteros solo en el primer resultado del informe que los lleva.
+- **`--acceso` en cinco bloques**, siempre en este orden y también cuando `ssh`
+  entra: máquina y red, disco, claves SSH y acceso, orden de virt-install y
+  archivos de cloud-init.
 - **Python 3.8 como mínimo.** Un test lo comprueba con
   `ast.parse(..., feature_version=(3, 8))`, pero no detecta funciones nuevas de
   la biblioteca (`str.removeprefix`, por ejemplo): no las uses.
