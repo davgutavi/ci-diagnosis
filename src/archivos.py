@@ -83,6 +83,11 @@ def comprobar_nombres(directorio):
             continue
         if not os.path.isfile(ruta):
             rs.append(error("%s no es un archivo normal" % nombre, fallo=FALLO_DE[nombre],
+                            detalle=["Es un directorio o un enlace roto."],
+                            efecto="virt-install no podrá usarlo.",
+                            arreglo=["Apártelo y cree el archivo de nuevo con nano:",
+                                     "$ mv %s %s.old" % (nombre, nombre),
+                                     "$ nano %s" % nombre],
                             seccion=SECCION_DE[nombre]))
             continue
         datos = leer_bytes(ruta)
@@ -260,7 +265,9 @@ def comprobar_user_data(texto, clave_servidor):
         return rs
     if not isinstance(datos, dict):
         rs.append(error("user-data no tiene la estructura esperada", fallo="B4",
-                        arreglo="compárelo línea a línea con el del manual.",
+                        efecto="cloud-init no creará el usuario administrador.",
+                        arreglo="compárelo línea a línea con el del manual: «users:» sin "
+                                "espacios delante y el usuario debajo, con «- name:».",
                         seccion=sec))
         return rs
 
@@ -282,6 +289,9 @@ def comprobar_user_data(texto, clave_servidor):
             detalle.append("Hay «%s:»; tiene que ser «users:»." % parecidas[0])
         rs.append(error("user-data no tiene la lista users", fallo="B4", detalle=detalle,
                         efecto="no se crea el usuario administrador.",
+                        arreglo="escriba «users:» al principio de la línea (sin espacios "
+                                "delante) y, debajo, «  - name: administrador» con el "
+                                "resto del usuario, como en el manual.",
                         seccion=sec))
         return rs
     if not isinstance(usuarios, list):
@@ -323,6 +333,8 @@ def comprobar_user_data(texto, clave_servidor):
                         detalle=["Tiene: %s" % "; ".join(sudo),
                                  "Tiene que ser: %s" % SUDO_ESPERADO],
                         efecto="sudo no funcionará como espera el manual.",
+                        arreglo="escriba la línea así, con las comillas rectas: "
+                                "«    sudo: ['%s']»." % SUDO_ESPERADO,
                         seccion=sec))
 
     grupos = admin.get("groups")
@@ -371,6 +383,12 @@ def comprobar_claves_user_data(admin, clave_servidor):
     else:
         rs.append(error("administrador no tiene ssh_authorized_keys", fallo="B5",
                         efecto="no podrá entrar: «Permission denied (publickey)».",
+                        arreglo=["Añada estas dos líneas al final del usuario, al nivel "
+                                 "de «shell:» la primera y dos espacios más la segunda:",
+                                 "$     ssh_authorized_keys:",
+                                 "$       - <el contenido de ~/.ssh/id_rsa.pub>",
+                                 "Para ver su clave pública (una sola línea que empieza "
+                                 "por ssh-rsa): cat ~/.ssh/id_rsa.pub"],
                         seccion=sec))
         return rs
     if isinstance(valor, str):
@@ -454,6 +472,8 @@ def comprobar_meta_data(texto, uvus, maquina):
                         detalle=["Tiene: %s" % iid],
                         efecto="si es el de otra máquina suya, puede estar "
                                "diagnosticando los archivos de esa otra máquina.",
+                        arreglo="instance-id: %s (si estos archivos son de otra máquina, "
+                                "indique esa: ./ci-diagnosis serverX)." % esperado,
                         seccion=sec))
     elif esperado:
         rs.append(ok("meta-data: instance-id %s" % iid))
@@ -462,7 +482,9 @@ def comprobar_meta_data(texto, uvus, maquina):
                         arreglo="local-hostname: %s" % (maquina or "serverX"), seccion=sec))
     elif maquina and str(host) != maquina:
         rs.append(aviso("El local-hostname de meta-data no es %s" % maquina,
-                        detalle=["Tiene: %s" % host], seccion=sec))
+                        detalle=["Tiene: %s" % host],
+                        efecto="la máquina se llamará %s por dentro." % host,
+                        arreglo="local-hostname: %s" % maquina, seccion=sec))
     elif maquina:
         rs.append(ok("meta-data: local-hostname %s" % host))
     return rs, datos
@@ -472,6 +494,11 @@ def comprobar_network_config(texto, red=None):
     """network-config (B6). Devuelve (resultados, IP o None)."""
     rs = []
     sec = "instanciar"
+    if red is not None:
+        base = str(red.red.network_address).rsplit(".", 1)[0]
+        ejemplo_ip, ejemplo_via = base + ".YYY/24", str(red.pasarela)
+    else:
+        ejemplo_ip, ejemplo_via = "192.168.XXX.YYY/24", "192.168.XXX.1"
     datos, problema = cargar_yaml("network-config", texto)
     if problema:
         return [problema], None
@@ -484,11 +511,16 @@ def comprobar_network_config(texto, red=None):
                         detalle=["Tiene: version: %s" % datos.get("version")]
                         if "version" in datos else [],
                         efecto="cloud-init lo interpreta con otro formato.",
+                        arreglo="la primera línea es «version: 2», sin espacios delante.",
                         seccion=sec))
     ethernets = datos.get("ethernets")
     if not isinstance(ethernets, dict):
         rs.append(error("network-config no tiene el bloque ethernets", fallo="B6",
-                        efecto="la máquina no tendrá su IP fija.", seccion=sec))
+                        efecto="la máquina no tendrá su IP fija.",
+                        arreglo="debajo de «version: 2», «ethernets:» sin espacios "
+                                "delante y, dentro, «  %s:» con su dirección, su ruta y "
+                                "sus DNS, como en el manual." % INTERFAZ,
+                        seccion=sec))
         return rs, None
     if INTERFAZ not in ethernets:
         rs.append(error("network-config no configura la interfaz %s" % INTERFAZ, fallo="B6",
@@ -500,16 +532,25 @@ def comprobar_network_config(texto, red=None):
     iface = ethernets[INTERFAZ]
     if not isinstance(iface, dict):
         rs.append(error("El bloque de %s está vacío o mal indentado" % INTERFAZ, fallo="B6",
+                        efecto="la máquina no tendrá su IP fija.",
+                        arreglo="addresses, routes y nameservers van dentro de «%s:», "
+                                "con dos espacios más que ella, como en el manual." % INTERFAZ,
                         seccion=sec))
         return rs, None
 
     direcciones = [str(d) for d in _como_lista(iface.get("addresses"))]
     if not direcciones:
         rs.append(error("network-config no tiene addresses", fallo="B6",
-                        efecto="la máquina no tendrá su IP fija.", seccion=sec))
+                        efecto="la máquina no tendrá su IP fija.",
+                        arreglo="dentro de %s: «addresses:» y, debajo, «- %s», con YYY "
+                                "entre 2 y 127 (distinta en cada máquina)." % (INTERFAZ, ejemplo_ip),
+                        seccion=sec))
         return rs, None
     if len(direcciones) > 1:
         rs.append(aviso("network-config tiene varias direcciones; el manual usa una",
+                        detalle=["Tiene: %s" % ", ".join(direcciones)],
+                        efecto="se revisa solo la primera.",
+                        arreglo="deje solo una: «- %s» debajo de «addresses:»." % direcciones[0],
                         seccion=sec))
     if "/" not in direcciones[0]:
         rs.append(error("La dirección %s no lleva /24" % direcciones[0], fallo="B6",
@@ -520,13 +561,20 @@ def comprobar_network_config(texto, red=None):
         interfaz = ipaddress.ip_interface(direcciones[0])
     except ValueError:
         rs.append(error("%s no es una dirección IP válida" % direcciones[0], fallo="B6",
+                        efecto="la máquina no tendrá su IP fija.",
+                        arreglo="«addresses:» y, debajo, «- %s», con YYY entre 2 y 127." % ejemplo_ip,
                         seccion=sec))
         return rs, None
     ip = interfaz.ip
     if interfaz.network.prefixlen != 24:
-        rs.append(aviso("La dirección %s no es /24" % direcciones[0], seccion=sec))
+        rs.append(aviso("La dirección %s no es /24" % direcciones[0],
+                        efecto="la máquina no tendrá la máscara de su red.",
+                        arreglo="escríbala así: %s/24" % ip, seccion=sec))
     if iface.get("dhcp4") in (True, "true", "yes"):
-        rs.append(aviso("network-config activa dhcp4 además de la IP fija", seccion=sec))
+        rs.append(aviso("network-config activa dhcp4 además de la IP fija",
+                        efecto="la máquina puede tener dos IP, y la del DHCP cambia.",
+                        arreglo="quite la línea dhcp4 (el manual no la lleva).",
+                        seccion=sec))
 
     via = None
     for ruta in _como_lista(iface.get("routes")):
@@ -541,24 +589,33 @@ def comprobar_network_config(texto, red=None):
     if via is None:
         rs.append(error("network-config no tiene la ruta por defecto", fallo="B6",
                         efecto="la máquina no saldrá de su red (apt update fallará).",
+                        arreglo="dentro de %s, como en el manual: «routes:» y, debajo, "
+                                "«  - to: default» y «    via: %s»." % (INTERFAZ, ejemplo_via),
                         seccion=sec))
     else:
         try:
             pasarela = ipaddress.ip_address(str(via))
         except ValueError:
             rs.append(error("La pasarela %s no es una dirección IP" % via, fallo="B6",
-                            seccion=sec))
+                            efecto="la máquina no saldrá de su red.",
+                            arreglo="via: %s" % ejemplo_via, seccion=sec))
 
     dns = [str(d) for d in _como_lista((iface.get("nameservers") or {}).get("addresses"))
            ] if isinstance(iface.get("nameservers"), dict) else []
     if not dns:
         rs.append(aviso("network-config no tiene servidores DNS",
                         efecto="la máquina no podrá resolver nombres (apt update fallará).",
-                        arreglo="añada el bloque nameservers del manual.", seccion=sec))
+                        arreglo="dentro de %s, como en el manual: «nameservers:», «addresses:» "
+                                "y una línea «- IP» por cada uno: %s."
+                                % (INTERFAZ, " y ".join(DNS_ESPERADOS)), seccion=sec))
     elif set(dns) != set(DNS_ESPERADOS):
         rs.append(aviso("Los DNS de network-config no son los del manual",
                         detalle=["Tiene: %s" % ", ".join(dns),
                                  "El manual: %s" % ", ".join(DNS_ESPERADOS)],
+                        efecto="si no funcionan, la máquina no resolverá nombres (apt "
+                               "update fallará).",
+                        arreglo="dentro de nameservers, «addresses:» y, debajo, una línea "
+                                "«- IP» por cada uno: %s." % " y ".join(DNS_ESPERADOS),
                         seccion=sec))
 
     if red is None:
@@ -568,16 +625,18 @@ def comprobar_network_config(texto, red=None):
     if ip not in red.red:
         rs.append(error("La IP %s no es de su red %s (%s)" % (ip, red.nombre, red.red),
                         fallo="B6", efecto="no podrá llegar a la máquina.",
-                        arreglo="use una IP de %s, entre la .2 y la .127." % red.red,
+                        arreglo="«addresses:» y, debajo, «- %s», con YYY entre 2 y 127." % ejemplo_ip,
                         seccion=sec))
     elif ip in (red.red.network_address, red.red.broadcast_address, red.pasarela):
         rs.append(error("La IP %s está reservada en su red" % ip, fallo="B6",
-                        arreglo="use una entre la .2 y la .127.", seccion=sec))
+                        arreglo="«addresses:» y, debajo, «- %s», con YYY entre 2 y 127." % ejemplo_ip,
+                        seccion=sec))
     elif red.en_dhcp(ip):
         rs.append(aviso("La IP %s está dentro del rango del DHCP (%s)" % (ip, rango),
                         fallo="B6",
                         efecto="el DHCP puede dársela también a otra máquina.",
-                        arreglo="use una entre la .2 y la .127.", seccion="red"))
+                        arreglo="«addresses:» y, debajo, «- %s», con YYY entre 2 y 127." % ejemplo_ip,
+                        seccion="red"))
     else:
         rs.append(ok("IP %s: de su red y fuera del DHCP" % ip))
     if pasarela is not None:

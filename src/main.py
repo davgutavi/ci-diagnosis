@@ -10,7 +10,9 @@ sección 5.4) y dice qué falla. Ejecútelo desde su silo (~/imagenesMV).
               Si no la indica, se toma del local-hostname de meta-data.
   --antes     revisión antes de virt-install (silo, red, imagen, archivos,
               claves).
-  --acceso    revisión de una máquina ya creada en la que no puede entrar.
+  --acceso    revisión de una máquina ya creada, en cinco bloques: la
+              máquina y su red, su disco, las claves SSH y el acceso, la
+              orden de virt-install y los archivos de cloud-init.
   --ip IP     la IP de la máquina, si no es la de su network-config.
   --version   muestra la versión.
   --ayuda     muestra esta ayuda.
@@ -104,6 +106,8 @@ def diagnosticar_antes(uvus, home, directorio, maquina, conn=None):
     los tests de esas partes. Devuelve (informe, máquina, existe la máquina).
     """
     informe = Informe()
+    CONTEXTO.clear()
+    CONTEXTO.update(uvus=uvus, maquina=maquina)
     res_claves, clave = comprobar_claves(home)
     red, existe = None, False
     if conn is not None:
@@ -113,6 +117,7 @@ def diagnosticar_antes(uvus, home, directorio, maquina, conn=None):
         res_red, red = comprobar_red(conn, uvus)
         informe.bloque("Red", res_red)
     res_archivos, maquina, ip = diagnosticar_archivos(uvus, directorio, maquina, clave, red)
+    CONTEXTO.update(maquina=maquina, ip=ip)
     if conn is not None:
         informe.bloque("Imagen y disco", comprobar_imagen_y_disco(directorio, maquina))
     informe.bloque("Archivos de cloud-init", res_archivos)
@@ -169,9 +174,13 @@ def _ip_de_network_config(directorio):
 
 
 def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
-    """Revisión de una máquina ya creada en la que no se puede entrar."""
+    """Revisión de una máquina ya creada, en cinco bloques: 1, la máquina y su red;
+    2, su disco; 3, las claves SSH y el acceso; 4, la orden de virt-install con la
+    que se creó, y 5, los archivos de cloud-init del silo."""
     informe = Informe()
     nombre = "%s-%s" % (uvus, maquina)
+    CONTEXTO.clear()
+    CONTEXTO.update(uvus=uvus, maquina=maquina)
     dominio = buscar_dominio(conn, nombre)
     if dominio is None:
         informe.bloque("Máquina", [error(
@@ -180,12 +189,8 @@ def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
                     "./ci-diagnosis --antes.", seccion="instanciar")])
         return informe
     m = Maquina(dominio)
-    informe.bloque("Máquina", comprobar_maquina(m, uvus))
     res_claves, clave = comprobar_claves(home)
     res_red, red = comprobar_red(conn, uvus)
-    problemas_red = [r for r in res_red if r.estado in (ERROR, AVISO)]
-    if problemas_red:
-        informe.bloque("Red", problemas_red)
 
     # La IP: la indicada, la de network-config si es de esta máquina, o la de ARP
     _, iid = _meta_del_silo(directorio)
@@ -194,8 +199,11 @@ def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
         ip, origen = _ip_de_network_config(directorio), "network-config"
     if ip is None and m.encendida:
         ip, origen = ip_por_arp(dominio), "las tablas ARP del servidor"
+    CONTEXTO["ip"] = ip
 
-    entra = False
+    # 1. La máquina y su red
+    maquina_y_red = comprobar_maquina(m, uvus) + res_red
+    acceso, entra = [], False
     if m.encendida:
         if ip is None:
             if iid == nombre:
@@ -204,64 +212,84 @@ def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
                 motivo = "el meta-data del silo es de otra máquina (%s)" % iid
             else:
                 motivo = "no hay meta-data en este directorio"
-            informe.bloque("Conectividad", [omitida(
-                "No se sabe la IP de la máquina: %s. Indíquela con --ip" % motivo)])
+            maquina_y_red.append(omitida(
+                "No se sabe la IP de la máquina: %s. Indíquela con --ip" % motivo))
+            acceso.append(omitida("Acceso por SSH: no se sabe la IP de la máquina"))
         else:
             res_con, abierto = comprobar_conectividad(ip)
-            informe.bloque("Conectividad", [ok("IP %s (de %s)" % (ip, origen))] + res_con)
+            maquina_y_red += [ok("IP %s (de %s)" % (ip, origen))] + res_con
             if abierto:
                 cifrada, en_agente = estado_de_la_clave(home)
-                res_ssh, entra = comprobar_ssh(ip, home, cifrada, en_agente, maquina)
-                informe.bloque("Acceso por SSH", res_ssh)
-        if not entra:
-            informe.bloque("Disco de la máquina", [omitida(
-                "Para revisar su disco, apáguela (virsh shutdown %s), espere a que "
-                "virsh domstate %s diga «shut off» y vuelva a ejecutar ./ci-diagnosis"
-                % (nombre, nombre))])
-    elif m.apagada:
-        informe.bloque("Conectividad", [omitida("Conectividad y SSH: la máquina está apagada")])
-        informe.bloque("Disco de la máquina", revisar_disco(conn, m, clave, directorio,
-                                                            iid, red))
-    if not entra:
-        informe.bloque("Orden de virt-install", comprobar_orden(home, uvus, nombre))
-        res_archivos, _, _ = diagnosticar_archivos(uvus, directorio, maquina, clave, red)
-        informe.bloque("Archivos de cloud-init (en el silo)", res_archivos)
-    informe.bloque("Claves SSH", res_claves)
+                acceso, entra = comprobar_ssh(ip, home, cifrada, en_agente, maquina)
+            else:
+                acceso.append(omitida("Acceso por SSH: el puerto 22 no responde "
+                                      "(bloque 1)"))
+    else:
+        estado = "apagada" if m.apagada else NOMBRES_ESTADO.get(m.estado, str(m.estado))
+        maquina_y_red.append(omitida("Conectividad: la máquina está %s" % estado))
+        acceso.append(omitida("Acceso por SSH: la máquina está %s" % estado))
+    informe.bloque("1. Máquina y red", maquina_y_red)
+
+    # 2. Su disco: por fuera siempre; por dentro, solo apagada
+    informe.bloque("2. Disco", revisar_disco(conn, m, clave, directorio, iid, red, entra))
+
+    # 3, 4 y 5
+    informe.bloque("3. Claves SSH y acceso", res_claves + acceso)
+    informe.bloque("4. Orden de virt-install", comprobar_orden(home, uvus, nombre))
+    res_archivos, _, _ = diagnosticar_archivos(uvus, directorio, maquina, clave, red)
+    informe.bloque("5. Archivos de cloud-init (en el silo)", res_archivos)
+    compactar_rehacer(informe.todos())
     return informe
 
 
-def revisar_disco(conn, maquina, clave, directorio, iid, red):
+def revisar_disco(conn, maquina, clave, directorio, iid, red, entra=False):
     if not maquina.discos:
-        return [error("La máquina no tiene ningún disco", seccion="instanciar")]
+        return [error("La máquina no tiene ningún disco", fallo="C1",
+                      efecto="no puede arrancar.", arreglo=pasos_rehacer(),
+                      seccion="instanciar")]
     disco = maquina.discos[0]
+    rs = [ok("Disco de la máquina: %s" % disco)]
+    if not os.path.exists(disco):
+        return rs + [error("No existe el disco de la máquina", fallo="B3",
+                           efecto="la máquina no puede arrancar.",
+                           arreglo=pasos_rehacer(), seccion="instanciar")]
+    por_fuera, falta_respaldo = comprobar_disco_cow(disco, None,
+                                                    existe_maquina=True)
+    rs += por_fuera
+    if maquina.encendida:
+        if entra:
+            rs.append(omitida("Por dentro: no hace falta revisarlo, puede entrar en la "
+                              "máquina"))
+        else:
+            rs.append(omitida(
+                "Por dentro: para revisarlo, apáguela (virsh shutdown %s), espere a que "
+                "virsh domstate %s diga «shut off» y vuelva a ejecutar ./ci-diagnosis"
+                % (maquina.nombre, maquina.nombre)))
+        return rs
+    if not maquina.apagada:
+        rs.append(omitida("Por dentro: la máquina tiene que estar apagada (virsh "
+                          "shutdown %s)" % maquina.nombre))
+        return rs
+    if falta_respaldo:
+        return rs
     for d in conn.listAllDomains(0):
         if d.name() != maquina.nombre and d.isActive() and disco in discos_de(d):
-            return [error("El disco lo está usando la máquina encendida %s" % d.name(),
-                          fallo="C2", seccion="instanciar")]
-    info, _ = info_imagen(disco)
-    respaldo = (info or {}).get("backing-filename")
-    if respaldo:
-        completo = info.get("full-backing-filename") or os.path.join(
-            os.path.dirname(disco), respaldo)
-        if not os.path.exists(completo):
-            # Visto en avantasia (6-nov): virsh start dice «Cannot access backing
-            # file ... No such file or directory», y guestfish no puede leer el disco
-            return [error("No está la imagen de la que depende el disco de la máquina",
-                          fallo="B3", detalle=["Disco: %s" % disco, "Respaldo: %s" % completo],
-                          efecto="la máquina no puede arrancar («Cannot access backing file "
-                                 "... No such file or directory») y su disco no se puede leer.",
-                          arreglo="devuelva la imagen base a ese sitio, con ese nombre: la "
-                                  "imagen base no se puede mover ni renombrar.",
-                          seccion="instanciar")]
+            return rs + [error(
+                "El disco lo está usando la máquina encendida %s" % d.name(),
+                fallo="C2", efecto="las dos máquinas acabarían estropeando el disco.",
+                arreglo="cada máquina necesita su propio disco. Apague %s (virsh shutdown "
+                        "%s) y no la arranque a la vez que esta." % (d.name(), d.name()),
+                seccion="instanciar")]
     previo = comprobar_libguestfs()
     if previo is not None and previo.estado == ERROR:
-        return [previo]
+        return rs + [previo]
     archivos, instancias, problema = leer_disco(disco)
     if problema is not None:
-        return [problema]
+        return rs + [problema]
     actual = leer_bytes(os.path.join(directorio, "user-data"))
     actual = actual.decode("utf-8", "replace") if actual is not None else None
-    rs = [ok("Disco leído: %s" % disco)] + ([previo] if previo else [])
+    rs += [ok("Por dentro: disco leído (con la máquina apagada)")] + ([previo] if previo
+                                                                     else [])
     return rs + comprobar_disco(archivos, instancias, clave, actual, iid, red)
 
 
@@ -325,7 +353,7 @@ def main(argv=None):
     print("ci-diagnosis %s · %s · usuario: %s · máquina: %s" % (
         VERSION, servidor, uvus, "%s-%s" % (uvus, maquina) if maquina else "sin determinar"))
     if modo == "acceso":
-        print("Modo: no puede entrar en la máquina (--acceso)")
+        print("Modo: revisión de la máquina ya creada (--acceso)")
         if opciones["modo"] is None:
             print("(La máquina ya existe. Para revisarla como antes de crearla: --antes)")
     else:

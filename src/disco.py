@@ -59,6 +59,11 @@ def leer_disco(disco):
         if "lock" in err:
             return {}, None, error("El disco está en uso (¿la máquina sigue encendida?)",
                                    detalle=["guestfish dice: %s" % ultima[0]],
+                                   arreglo=["Compruebe que la máquina está apagada y "
+                                            "repita:",
+                                            "$ virsh domstate %s" % nombre_de_maquina(),
+                                            "Si no dice «shut off», apáguela: virsh "
+                                            "shutdown %s" % nombre_de_maquina()],
                                    seccion="acceso")
         return {}, None, error("No se ha podido leer el disco",
                                detalle=["guestfish dice: %s" % ultima[0]],
@@ -101,6 +106,12 @@ def _con_prefijo(resultados, prefijo):
         if len(texto) > 1 and texto[0].isupper() and texto[1].islower():
             texto = texto[0].lower() + texto[1:]
         r.texto = prefijo + texto
+        # La máquina ya está creada: corregir el archivo no basta
+        if r.arreglo:
+            r.arreglo = pasos_rehacer("Corrija el archivo del silo: %s" % texto_del_arreglo(
+                r.arreglo).replace("\n", " "))
+        elif r.estado == ERROR:
+            r.arreglo = pasos_rehacer()
     return resultados
 
 
@@ -121,13 +132,16 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
         rs.append(error("cloud-init no llegó a configurar la máquina", fallo="C1",
                         detalle=["No hay ninguna instancia en %s." % DIR_INSTANCIAS],
                         efecto="la máquina no tiene ni el usuario ni la IP del manual.",
-                        arreglo="compruebe que pasó los tres archivos a virt-install.",
+                        arreglo=pasos_rehacer("Compruebe en el bloque 4 que la orden de "
+                                              "virt-install lleva --cloud-init con los "
+                                              "tres archivos."),
                         seccion=sec))
     elif len(instancias) > 1:
         rs.append(aviso("El disco se ha configurado con %d instance-id distintos" % len(instancias),
                         fallo="D2", detalle=["Instancias: %s." % ", ".join(instancias)],
-                        efecto="el disco se reutilizó con otro meta-data.",
-                        arreglo="para una máquina nueva, use siempre un disco nuevo.",
+                        efecto="el disco se reutilizó con otro meta-data: la máquina "
+                               "mezcla la configuración de varias.",
+                        arreglo=pasos_rehacer(),
                         seccion=sec))
     else:
         rs.append(ok("cloud-init configuró la máquina con el instance-id %s" % instancias[0]))
@@ -138,7 +152,8 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
     if estado is not None and not fuente:
         rs.append(error("cloud-init no encontró los archivos de configuración", fallo="C1",
                         efecto="la máquina arrancó sin user-data, meta-data ni network-config.",
-                        arreglo="compruebe la opción --cloud-init de virt-install.",
+                        arreglo=pasos_rehacer("Compruebe en el bloque 4 la opción "
+                                              "--cloud-init de virt-install."),
                         seccion=sec))
 
     resultado = _json(archivos.get("/var/lib/cloud/data/result.json"))
@@ -148,11 +163,23 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
         if errores:
             rs.append(error("cloud-init terminó con errores", fallo="B4",
                             detalle=["cloud-init: %s" % str(e)[:200] for e in errores[:4]],
+                            efecto="la parte de user-data o network-config que falló no "
+                                   "se aplicó a la máquina.",
+                            arreglo=pasos_rehacer(
+                                "Los mensajes de arriba dicen qué falló; corríjalo en "
+                                "user-data o network-config (los bloques 5 le ayudan). "
+                                "cloud-init solo se aplica en el primer arranque, por eso "
+                                "hay que volver a crearla."),
                             seccion=sec))
         avisos = [(nivel, m) for nivel, ms in recuperables.items() for m in ms]
         if avisos:
             rs.append(aviso("cloud-init dejó avisos", fallo="B4",
                             detalle=["%s: %s" % (n, str(m)[:200]) for n, m in avisos[:4]],
+                            efecto="suelen venir de una clave de user-data mal escrita u "
+                                   "obsoleta: esa parte puede no haberse aplicado.",
+                            arreglo="si la máquina funciona, no hace falta rehacerla. Si no, "
+                                    "corrija en user-data lo que dicen los avisos y vuelva a "
+                                    "crearla con un disco nuevo.",
                             seccion=sec))
         if not errores and not avisos:
             rs.append(ok("cloud-init terminó sin errores ni avisos"))
@@ -167,8 +194,7 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
                 fallo="D2" if mismo_iid else None,
                 efecto="cloud-init solo se aplica en el primer arranque: corregir "
                        "user-data después no cambia la máquina." if mismo_iid else None,
-                arreglo="elimine la máquina y su disco, y créela de nuevo desde el "
-                        "primer paso de la 5.4.2." if mismo_iid else None,
+                arreglo=pasos_rehacer() if mismo_iid else None,
                 seccion=sec))
         problemas_ud = [r for r in comprobar_user_data(aplicado, clave)
                         if r.estado in (ERROR, AVISO)]
@@ -181,8 +207,10 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
         if texto is None:
             rs.append(error("En la máquina, administrador no tiene authorized_keys",
                             fallo="B5", efecto="«Permission denied (publickey)».",
-                            arreglo="revise ssh_authorized_keys en user-data (o si se creó "
-                                    "el usuario administrador).", seccion=sec))
+                            arreglo=pasos_rehacer(
+                                "Revise en user-data (bloque 5) que crea el usuario "
+                                "administrador y que lleva ssh_authorized_keys con su "
+                                "clave."), seccion=sec))
         else:
             instaladas = [c for c in (analizar_clave_publica(l) for l in texto.splitlines()
                                       if l.strip() and not l.startswith("#")) if c]
@@ -204,8 +232,7 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
                     efecto="el disco ya se configuró una vez con este instance-id: corregir "
                            "user-data y crear la máquina con el mismo disco no cambia nada. "
                            "ssh seguirá respondiendo «Permission denied (publickey)».",
-                    arreglo="elimine la máquina y su disco, y créela de nuevo desde el "
-                            "primer paso de la 5.4.2, con un disco nuevo.",
+                    arreglo=pasos_rehacer(),
                     seccion=sec))
             else:
                 rs.append(error(
@@ -213,8 +240,10 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
                     detalle=["En la máquina: %s" % c.describir() for c in instaladas]
                     + ["id_rsa.pub:    %s" % clave.describir()],
                     efecto="«Permission denied (publickey)».",
-                    arreglo="si regeneró la clave después de crear la máquina, vea la "
-                            "FAQ B.3; si no, corrija user-data y cree la máquina de nuevo.",
+                    arreglo=pasos_rehacer(
+                        "Si regeneró la clave después de crear la máquina, esta solo "
+                        "acepta la anterior (FAQ B.3). Ponga en user-data la de ahora "
+                        "(cat ~/.ssh/id_rsa.pub)."),
                     seccion="faq-publickey"))
 
     # La red que quedó en la máquina
@@ -234,5 +263,8 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
     elif "/etc/netplan/50-cloud-init.yaml" in archivos and netplan is None:
         rs.append(error("La máquina no tiene la configuración de red de cloud-init",
                         fallo="B6", efecto="no tiene la IP fija de network-config.",
+                        arreglo=pasos_rehacer(
+                            "Revise network-config (bloque 5) y que la orden de "
+                            "virt-install lo lleva en --cloud-init (bloque 4)."),
                         seccion=sec))
     return rs

@@ -210,7 +210,8 @@ class TestOrden(unittest.TestCase):
                  "--network network=default")
         rs = self.revisar(orden)
         self.assertEqual(len(con_estado(rs, cd.ERROR)), 1)
-        self.assertEqual(len(con_estado(rs, cd.AVISO)), 3)
+        # --import, --os-variant, la red y --noautoconsole
+        self.assertEqual(len(con_estado(rs, cd.AVISO)), 4)
 
     def test_en_un_registro_rotado(self):
         rs = self.revisar(MANUAL.replace("--import ", ""), archivo="virt-install.log.2")
@@ -240,6 +241,57 @@ class TestOrden(unittest.TestCase):
 
     def test_sin_intento_anterior(self):
         self.assertEqual(cd.comprobar_intento_anterior(self.home, UVUS, "alu0000-server1"), [])
+
+    def test_muestra_la_orden(self):
+        rs = self.revisar(MANUAL)
+        self.assertEqual(rs[0].estado, cd.OK)
+        self.assertEqual(rs[0].detalle, ["virt-install " + MANUAL])
+        self.assertIn("como la del manual", rs[-1].texto)
+
+    def test_la_orden_del_manual_es_la_buena(self):
+        # La orden que se da en las soluciones no tiene ningún problema
+        rs = self.revisar(cd.orden_virt_install(UVUS, "server1")[len("virt-install "):])
+        self.assertEqual(problemas(rs), [])
+
+    def test_maquina_creada_con_orden_mala_lleva_los_pasos(self):
+        rs = self.revisar(MANUAL.replace(",network-config=network-config", "")
+                          .replace("network=alu0000-red", "network=default"))
+        graves = problemas(rs)
+        self.assertEqual(len(graves), 2)
+        pasos = graves[0].arreglo
+        self.assertIsInstance(pasos, cd.PasosRehacer)
+        self.assertIn("$ virsh undefine alu0000-server1 --remove-all-storage", pasos)
+        self.assertIn("$ " + cd.orden_virt_install(UVUS, "server1"), pasos)
+        self.assertIn("network=alu0000-red", pasos.corregir)
+        self.assertIn("arriba", graves[1].arreglo)
+
+    def test_antes_basta_con_la_orden_del_manual(self):
+        self.revisar(MANUAL.replace("--cloud-init user-data=user-data,meta-data=meta-data,"
+                                    "network-config=network-config ", ""))
+        rs = cd.comprobar_intento_anterior(self.home, UVUS, "alu0000-server1")
+        pasos = con_estado(rs, cd.ERROR)[0].arreglo
+        self.assertNotIsInstance(pasos, cd.PasosRehacer)
+        self.assertIn("$ " + cd.orden_virt_install(UVUS, "server1"), pasos)
+
+    def test_otros_archivos_ram_y_disco(self):
+        rs = self.revisar(MANUAL.replace("user-data=user-data", "user-data=user-data.yaml")
+                          .replace("--ram=2048", "--ram=1024")
+                          .replace("path=server1.qcow2", "path=server2.qcow2"))
+        textos = texto_de(con_estado(rs, cd.AVISO))
+        self.assertIn("user-data=user-data.yaml", textos)
+        self.assertIn("1024 MiB", textos)
+        self.assertIn("server2.qcow2", textos)
+        self.assertEqual(con_estado(rs, cd.ERROR), [])
+
+    def test_error_conocido_de_virt_install(self):
+        escribir(os.path.join(self.home, ".cache", "virt-manager", "virt-install.log"),
+                 LINEA % MANUAL + "[Thu, 05 Nov 2026 10:00:02 virt-install 1234] ERROR "
+                 "(cli:255) Size must be specified for non existent volume "
+                 "'server1.qcow2'\n")
+        rs = cd.comprobar_orden(self.home, UVUS, "alu0000-server1", existe=False)
+        mal = con_estado(rs, cd.ERROR)[0]
+        self.assertEqual(mal.fallo, "B3")
+        self.assertIn("qemu-img create", mal.arreglo)
 
     def test_sin_registro(self):
         rs = cd.comprobar_orden(self.home, UVUS, "alu0000-server1")

@@ -5,7 +5,6 @@
 # por los nombres de los silos, que no identifican al dueño (catálogo, sección 0).
 
 URI = "qemu:///system"
-IMAGEN_BASE = "noble-server-cloudimg-amd64.img"
 TAM_IMAGEN_BASE = 3758096384          # 3.5 GiB (manual, 5.4.1)
 TAM_DISCO = 40 * 1024 ** 3            # 40 GiB (manual, 5.4.2)
 USUARIO_QEMU = "libvirt-qemu"
@@ -177,7 +176,13 @@ def comprobar_silo(silos, uvus, home, directorio):
                 rs.append(ok("%s es su silo %s" % (directorio, s.nombre)))
             else:
                 rs.append(aviso("El silo de %s se llama %s, no %s" % (
-                    directorio, s.nombre, nombre_esperado), seccion="silo"))
+                    directorio, s.nombre, nombre_esperado),
+                    efecto="ninguno si funciona: solo se aparta del nombre del manual.",
+                    arreglo="no hace falta cambiarlo. Si quiere el nombre del manual: "
+                            "virsh pool-destroy %s && virsh pool-undefine %s, y defínalo "
+                            "de nuevo como en la sección 5.2 (no borra sus archivos)."
+                            % (s.nombre, s.nombre),
+                    seccion="silo"))
             if not s.activo:
                 rs.append(error("El silo %s está parado" % s.nombre, fallo="B2",
                                 efecto="virt-install no lo reconocerá como silo.",
@@ -188,7 +193,12 @@ def comprobar_silo(silos, uvus, home, directorio):
                                 arreglo="virsh pool-autostart %s" % s.nombre,
                                 seccion="silo"))
         if dir_r != esperado:
-            rs.append(aviso("Según el manual, su silo es ~/imagenesMV", seccion="silo"))
+            rs.append(aviso("Según el manual, su silo es ~/imagenesMV",
+                            efecto="ninguno si funciona; las soluciones de esta revisión "
+                                   "dicen «cd ~/imagenesMV»: use su directorio.",
+                            arreglo="no hace falta cambiarlo; trabaje siempre desde %s."
+                                    % directorio,
+                            seccion="silo"))
 
     # Dueño y escritura del directorio actual (B9: si lo creó libvirt, es de root)
     try:
@@ -220,6 +230,14 @@ def comprobar_silo(silos, uvus, home, directorio):
             rs.append(aviso("Su silo %s no apunta a %s" % (s.nombre, directorio),
                             fallo="B9", detalle=detalle,
                             efecto="los archivos de este directorio no están en él.",
+                            arreglo=("trabaje desde el directorio de su silo: cd %s"
+                                     % s.ruta) if os.path.isdir(s.ruta or "") else
+                            ["Defina el silo de nuevo sobre el directorio correcto (no "
+                             "borra archivos):",
+                             "$ virsh pool-destroy %s" % s.nombre,
+                             "$ virsh pool-undefine %s" % s.nombre,
+                             "y créelo otra vez como en la sección 5.2, desde %s."
+                             % directorio],
                             seccion="silo"))
 
     # Silos sobre su home entero o sobre su .ssh (sección 0)
@@ -302,20 +320,48 @@ def comprobar_red(conn, uvus):
                         arreglo="virsh net-autostart %s" % nombre, seccion="red"))
     if red.modo != "nat":
         rs.append(aviso("La red %s no es de tipo NAT" % nombre,
-                        detalle=["Modo: %s" % (red.modo or "aislada")], seccion="red"))
+                        detalle=["Modo: %s" % (red.modo or "aislada")],
+                        efecto="sin NAT, las máquinas no salen a Internet (apt update "
+                               "fallará).",
+                        arreglo=["No hace falta si sus máquinas funcionan. Para dejarla como el manual, "
+                          "con sus máquinas apagadas, elimínela y créela de nuevo como en "
+                          "la sección 5.3 (con el mismo nombre y el mismo XXX):",
+                          "$ virsh net-destroy %s" % nombre,
+                          "$ virsh net-undefine %s" % nombre],
+                        seccion="red"))
     if red.red.prefixlen != 24 or red.pasarela != red.red.network_address + 1:
         rs.append(aviso("La red %s no es como la del manual" % nombre,
                         detalle=["Tiene %s con pasarela %s; el manual usa "
                                  "192.168.XXX.0/24 con pasarela .1." % (red.red, red.pasarela)],
+                        efecto="las IP y la pasarela del manual (192.168.XXX.YYY/24, vía "
+                               ".1) no le sirven: use las de su red.",
+                        arreglo=["No hace falta si sus máquinas funcionan. Para dejarla como el manual, "
+                          "con sus máquinas apagadas, elimínela y créela de nuevo como en "
+                          "la sección 5.3 (con el mismo nombre y el mismo XXX):",
+                          "$ virsh net-destroy %s" % nombre,
+                          "$ virsh net-undefine %s" % nombre],
                         seccion="red"))
     esperado = [(red.red.network_address + 128, red.red.network_address + 254)]
     if red.red.prefixlen == 24 and red.dhcp != esperado:
         rs.append(aviso("El DHCP de la red %s no es el del manual (de .128 a .254)" % nombre,
                         detalle=["Tiene: %s." % ", ".join("%s-%s" % r for r in red.dhcp)
                                  if red.dhcp else "Sin DHCP."],
+                        efecto="si el DHCP reparte las IP de la .2 a la .127, puede dar a "
+                               "otra máquina la IP fija de una de las suyas.",
+                        arreglo=["No hace falta si sus máquinas funcionan. Para dejarla como el manual, "
+                          "con sus máquinas apagadas, elimínela y créela de nuevo como en "
+                          "la sección 5.3 (con el mismo nombre y el mismo XXX):",
+                          "$ virsh net-destroy %s" % nombre,
+                          "$ virsh net-undefine %s" % nombre],
                         seccion="red"))
     if red.ipv6:
         rs.append(aviso("La red %s tiene IPv6; el manual no lo activa" % nombre,
+                        efecto="ninguno conocido.",
+                        arreglo=["No hace falta si sus máquinas funcionan. Para dejarla como el manual, "
+                          "con sus máquinas apagadas, elimínela y créela de nuevo como en "
+                          "la sección 5.3 (con el mismo nombre y el mismo XXX):",
+                          "$ virsh net-destroy %s" % nombre,
+                          "$ virsh net-undefine %s" % nombre],
                         seccion="red"))
 
     # A2: otra red del servidor con la misma subred
@@ -384,7 +430,12 @@ def comprobar_imagen_y_disco(directorio, maquina):
     else:
         info, problema = info_imagen(base)
         if info is None:
-            rs.append(aviso("No se ha podido leer la imagen base: %s" % problema))
+            rs.append(aviso("No se ha podido leer la imagen base: %s" % problema,
+                            efecto="si está dañada, la máquina no arrancará.",
+                            arreglo="compruebe que es suya y que puede leerla (ls -l %s). "
+                                    "Si no, descárguela de nuevo en el silo, sin cambiarle "
+                                    "el nombre." % IMAGEN_BASE,
+                            seccion="preliminar"))
         elif info.get("format") != "qcow2":
             rs.append(error("La imagen base no está en formato qcow2", fallo="B3",
                             detalle=["Formato: %s" % info.get("format")],
@@ -394,6 +445,8 @@ def comprobar_imagen_y_disco(directorio, maquina):
             rs.append(aviso("La imagen base no mide 3.5 GiB", fallo="B3",
                             detalle=["Tamaño virtual: %s bytes" % info.get("virtual-size")],
                             efecto="si Canonical ha cambiado la imagen, puede ser normal.",
+                            arreglo="compruebe que descargó la de Ubuntu 24.04 (noble) "
+                                    "del manual; si no, descárguela de nuevo.",
                             seccion="preliminar"))
         else:
             rs.append(ok("Imagen base: qcow2 de 3.5 GiB"))
@@ -405,17 +458,34 @@ def comprobar_imagen_y_disco(directorio, maquina):
         return rs
     nombre = "%s.qcow2" % maquina
     disco = os.path.join(directorio, nombre)
-    crear = ("qemu-img create %s -f qcow2 -b %s -F qcow2 40G" % (nombre, IMAGEN_BASE))
     if not os.path.exists(disco):
         rs.append(error("No existe el disco %s" % nombre, fallo="B3",
                         efecto="virt-install dirá «Size must be specified for non existent "
                                "volume '%s'»." % nombre,
-                        arreglo=crear, seccion="instanciar"))
+                        arreglo=orden_crear_disco(maquina), seccion="instanciar"))
         return rs
+    r, _ = comprobar_disco_cow(disco, maquina, existe_maquina=False)
+    return rs + r
+
+
+def comprobar_disco_cow(disco, maquina, existe_maquina):
+    """B3: el disco de la máquina (formato, tamaño y respaldo), con qemu-img info.
+
+    existe_maquina: si la máquina ya está creada, arreglar el disco es volver a
+    crearla entera. Devuelve (resultados, falta la imagen de la que depende)."""
+    rs = []
+    nombre = os.path.basename(disco)
+    crear = orden_crear_disco(maquina)
     info, problema = info_imagen(disco)
     if info is None:
-        rs.append(aviso("No se ha podido leer %s: %s" % (nombre, problema)))
-        return rs
+        rs.append(aviso("No se ha podido leer %s: %s" % (nombre, problema),
+                        efecto="si está dañado, la máquina no arrancará.",
+                        arreglo="compruebe que es suyo y que puede leerlo (ls -l %s). %s"
+                                % (disco, "Si está dañado, vuelva a crear la máquina."
+                                   if existe_maquina else
+                                   "Si está dañado, bórrelo y créelo de nuevo: " + crear),
+                        seccion="instanciar"))
+        return rs, False
     malos = []
     if info.get("format") != "qcow2":
         malos.append("formato %s, no qcow2" % info.get("format"))
@@ -431,21 +501,34 @@ def comprobar_imagen_y_disco(directorio, maquina):
     if malos:
         rs.append(error("El disco %s no es como el del manual" % nombre, fallo="B3",
                         detalle=[m[0].upper() + m[1:] + "." for m in malos],
-                        arreglo="bórrelo y vuelva a crearlo: %s" % crear,
+                        efecto="la máquina puede no arrancar o quedarse sin espacio.",
+                        arreglo=pasos_rehacer() if existe_maquina else
+                        ["Bórrelo y créelo de nuevo, desde ~/imagenesMV:",
+                         "$ rm %s" % nombre, "$ " + crear],
                         seccion="instanciar"))
     else:
         rs.append(ok("%s: qcow2 de 40 GiB, copia COW de %s" % (nombre, IMAGEN_BASE)))
+    falta = False
     if respaldo is not None:
-        completo = info.get("full-backing-filename") or os.path.join(directorio, respaldo)
+        completo = info.get("full-backing-filename") or os.path.join(
+            os.path.dirname(disco), respaldo)
         if not os.path.exists(completo):
-            rs.append(error("No está la imagen de la que depende %s" % nombre, fallo="B3",
-                            detalle=["Respaldo: %s" % completo],
-                            efecto="la máquina no podrá arrancar.",
-                            arreglo="la imagen base no se puede mover ni renombrar.",
+            falta = True
+            # Visto en avantasia (6-nov): virsh start dice «Cannot access backing
+            # file ... No such file or directory», y guestfish no puede leer el disco
+            rs.append(error("No está la imagen de la que depende el disco %s" % nombre,
+                            fallo="B3", detalle=["Respaldo: %s" % completo],
+                            efecto="la máquina no puede arrancar («Cannot access backing "
+                                   "file ... No such file or directory») y su disco no se "
+                                   "puede leer.",
+                            arreglo="devuelva la imagen base a ese sitio, con ese nombre "
+                                    "(mv ... %s): la imagen base no se puede mover ni "
+                                    "renombrar mientras haya discos que dependan de ella."
+                                    % completo,
                             seccion="instanciar"))
     if _escribible_por_otros(disco):
         rs.append(_aviso_escribible(disco, nombre))
-    return rs
+    return rs, falta
 
 
 def discos_de(dominio):
@@ -499,7 +582,10 @@ def comprobar_nombres_libres(conn, uvus, home, directorio, maquina, ip=None, red
                                 efecto="virt-install dirá «Disk ... is already in use "
                                        "by other guests» si la otra está encendida; si está "
                                        "apagada, las dos acabarán estropeando el disco.",
-                                arreglo="cree un disco nuevo para esta máquina.",
+                                arreglo=["Cada máquina necesita su propio disco. Cree uno "
+                                         "nuevo para esta (con otro nombre si el otro "
+                                         "sigue en uso) y póngalo en --disk path=:",
+                                         "$ " + orden_crear_disco(maquina)],
                                 seccion="instanciar"))
 
     # Máquinas suyas (por los discos) sin el UVUS en el nombre
@@ -512,13 +598,20 @@ def comprobar_nombres_libres(conn, uvus, home, directorio, maquina, ip=None, red
                                 efecto="la creó un virt-install con «-noautoconsole» (un "
                                        "solo guion): virt-install lo entiende como "
                                        "«--name oautoconsole».",
-                                arreglo="elimínela; las opciones llevan dos guiones.",
+                                arreglo=["Elimínela con su disco y repita virt-install con "
+                                         "--noautoconsole (dos guiones):",
+                                         "$ virsh destroy oautoconsole",
+                                         "$ virsh undefine oautoconsole --remove-all-storage",
+                                         "Eso borra también su disco: créelo de nuevo.",
+                                         "$ " + orden_crear_disco(maquina)],
                                 seccion="instanciar"))
             else:
                 rs.append(aviso("La máquina %s usa un disco suyo y no lleva su UVUS" % d.name(),
                                 fallo="A3",
                                 efecto="todos comparten la conexión: un nombre sin UVUS "
                                        "puede chocar con el de otro.",
+                                arreglo="renómbrela con la máquina apagada: virsh domrename "
+                                        "%s %s-%s" % (d.name(), uvus, d.name()),
                                 seccion="instanciar"))
 
     # D5: algo responde ya en la IP de network-config

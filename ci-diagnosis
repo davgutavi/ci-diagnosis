@@ -32,7 +32,7 @@ try:
 except ImportError:  # sin PyYAML se omiten las comprobaciones de estructura
     yaml = None
 
-VERSION = "1.0.2"
+VERSION = "1.1.0-dev"
 
 # Si José Antonio decide que la herramienta solo señale los fallos, basta con
 # poner esto a False: «Cómo arreglarlo» desaparece de toda la salida.
@@ -50,9 +50,12 @@ class Resultado:
     estado   OK, AVISO, ERROR u OMITIDA (no comprobada: falla algo de lo que depende)
     texto    una línea con lo comprobado o lo que falla
     fallo    código del catálogo (B5, D6...), si lo hay
-    detalle  líneas con datos concretos (números de línea, huellas...)
+    detalle  líneas con datos concretos (números de línea, huellas...). En los OK
+             también se muestran (por ejemplo, la orden de virt-install)
     efecto   qué pasará si no se arregla
-    arreglo  cómo arreglarlo
+    arreglo  cómo arreglarlo: un texto, o una lista de pasos. En la lista, los
+             pasos que empiezan por «$ » son órdenes: se muestran tal cual, en
+             una sola línea, para que se puedan copiar
     seccion  clave de SECCIONES (textos.py)
     """
 
@@ -119,6 +122,28 @@ def _envolver(texto, primera, resto):
                          break_long_words=False) or [primera.rstrip()]
 
 
+def texto_del_arreglo(arreglo):
+    """El arreglo como un solo texto (para buscar en él)."""
+    if arreglo is None or isinstance(arreglo, str):
+        return arreglo or ""
+    return "\n".join(p[2:] if p.startswith("$ ") else p for p in arreglo)
+
+
+def _lineas_del_arreglo(arreglo):
+    if isinstance(arreglo, str):
+        return _envolver("Cómo arreglarlo: " + arreglo, SANGRIA, SANGRIA)
+    lineas = [SANGRIA + "Cómo arreglarlo:"]
+    for paso in arreglo:
+        if paso.startswith("$ "):
+            # Una orden: nunca se parte, para que se pueda copiar entera
+            lineas.append(SANGRIA + "     " + paso[2:])
+        else:
+            # Los pasos numerados («1. ...») siguen alineados tras el número
+            resto = "     " if re.match(r"^\d\. ", paso) else "  "
+            lineas += _envolver(paso, SANGRIA + "  ", SANGRIA + resto)
+    return lineas
+
+
 def formatear_resultado(r, color=False):
     etiqueta = r.estado.ljust(7)
     if color:
@@ -126,14 +151,14 @@ def formatear_resultado(r, color=False):
     texto = r.texto + (" [%s]" % r.fallo if r.fallo else "")
     lineas = _envolver(texto, "  " + "X" * 7, SANGRIA)
     lineas[0] = "  " + etiqueta + lineas[0][9:]
-    if r.estado in (OK, OMITIDA):
-        return lineas
     for d in r.detalle:
         lineas += _envolver(d, SANGRIA, SANGRIA + "  ")
+    if r.estado in (OK, OMITIDA):
+        return lineas
     if r.efecto:
         lineas += _envolver("Efecto: " + r.efecto, SANGRIA, SANGRIA)
     if r.arreglo and MOSTRAR_ARREGLO:
-        lineas += _envolver("Cómo arreglarlo: " + r.arreglo, SANGRIA, SANGRIA)
+        lineas += _lineas_del_arreglo(r.arreglo)
     if r.seccion:
         lineas += _envolver("Manual: " + SECCIONES[r.seccion], SANGRIA, SANGRIA)
     return lineas
@@ -222,6 +247,89 @@ SUDO_ESPERADO = "ALL=(ALL) NOPASSWD:ALL"
 INTERFAZ = "enp1s0"
 DNS_ESPERADOS = ("150.214.186.69", "150.214.130.15")
 ARCHIVOS_CI = ("user-data", "meta-data", "network-config")
+IMAGEN_BASE = "noble-server-cloudimg-amd64.img"
+
+# Lo que se sabe del alumno y de su máquina en esta revisión, para que las
+# soluciones lleven sus nombres reales (lo rellena main; si falta algo, se usa
+# el marcador del manual)
+CONTEXTO = {}
+
+
+def _ctx(clave, defecto):
+    valor = CONTEXTO.get(clave)
+    return str(valor) if valor else defecto
+
+
+def nombre_de_maquina():
+    return "%s-%s" % (_ctx("uvus", "<uvus>"), _ctx("maquina", "serverX"))
+
+
+def orden_crear_disco(maquina=None):
+    return ("qemu-img create %s.qcow2 -f qcow2 -b %s -F qcow2 40G"
+            % (maquina or _ctx("maquina", "serverX"), IMAGEN_BASE))
+
+
+def orden_virt_install(uvus=None, maquina=None):
+    """La orden del manual (5.4.2), con los nombres del alumno."""
+    uvus = uvus or _ctx("uvus", "<uvus>")
+    maquina = maquina or _ctx("maquina", "serverX")
+    return ("virt-install --name=%s-%s --cloud-init user-data=user-data,"
+            "meta-data=meta-data,network-config=network-config --ram=2048 --vcpus=2 "
+            "--import --disk path=%s.qcow2 --os-variant=ubuntu24.04 --network "
+            "network=%s-red --noautoconsole" % (uvus, maquina, maquina, uvus))
+
+
+class PasosRehacer(list):
+    """Los pasos para volver a crear la máquina (una lista de pasos), con lo que
+    hay que corregir antes. En un informe solo se muestran enteros una vez."""
+    corregir = None
+
+
+def pasos_rehacer(corregir=None, uvus=None, maquina=None):
+    """Los pasos para volver a crear la máquina con un disco nuevo.
+
+    corregir: lo que hay que corregir antes (un texto), si hay algo. uvus y
+    maquina: si no se indican, los de CONTEXTO."""
+    uvus = uvus or _ctx("uvus", "<uvus>")
+    maquina = maquina or _ctx("maquina", "serverX")
+    nombre = "%s-%s" % (uvus, maquina)
+    ip = _ctx("ip", "192.168.XXX.YYY")
+    pasos = ["Vuelva a crear la máquina con un disco nuevo, desde ~/imagenesMV "
+             "(cd ~/imagenesMV):"]
+    n = 1
+    if corregir:
+        pasos.append("%d. %s" % (n, corregir))
+        n += 1
+    pasos += ["%d. Elimine la máquina y su disco (la imagen base no se borra). Si "
+              "está apagada, la primera orden dice que no está activa: no importa." % n,
+              "$ virsh destroy %s" % nombre,
+              "$ virsh undefine %s --remove-all-storage" % nombre,
+              "%d. Cree un disco nuevo:" % (n + 1),
+              "$ " + orden_crear_disco(maquina),
+              "%d. Cree la máquina (es una sola línea):" % (n + 2),
+              "$ " + orden_virt_install(uvus, maquina),
+              "%d. Olvide la huella de la máquina anterior y, pasado un minuto, entre:"
+              % (n + 3),
+              "$ ssh-keygen -R %s" % ip,
+              "$ ssh %s@%s" % (USUARIO_VM, ip)]
+    resultado = PasosRehacer(pasos)
+    resultado.corregir = corregir
+    return resultado
+
+
+def compactar_rehacer(resultados):
+    """Los pasos para volver a crear la máquina, enteros solo la primera vez."""
+    primero = None
+    for r in resultados:
+        if not isinstance(r.arreglo, PasosRehacer):
+            continue
+        if primero is None:
+            primero = r
+            continue
+        corto = "vuelva a crear la máquina con un disco nuevo: los pasos están más " \
+                "arriba, en «%s»." % primero.texto
+        r.arreglo = ("%s Después, %s" % (r.arreglo.corregir, corto)
+                     if r.arreglo.corregir else corto[0].upper() + corto[1:])
 
 
 # --- Claves SSH (B5, B7, B10, D6) -------------------------------------------
@@ -387,8 +495,13 @@ def comprobar_claves(home):
             "No existe ~/.ssh/id_rsa", fallo="B7",
             efecto="ssh no tiene con qué entrar en las máquinas: "
                    "«Permission denied (publickey)».",
-            arreglo="si la borró, genere una pareja nueva («ssh-keygen -t rsa») y "
-                    "rehaga user-data y las máquinas creadas con la anterior.",
+            arreglo=["Si la borró, aparte la pública que queda y genere una pareja "
+                     "nueva (acepte el nombre que propone):",
+                     "$ mv ~/.ssh/id_rsa.pub ~/.ssh/id_rsa.pub.vieja",
+                     "$ ssh-keygen -t rsa",
+                     "Después ponga la nueva ~/.ssh/id_rsa.pub en user-data y vuelva a "
+                     "crear las máquinas que ya tenga: las anteriores solo aceptan la "
+                     "clave que se perdió."],
             seccion="faq-publickey"))
         return rs, publica
 
@@ -413,6 +526,15 @@ def comprobar_claves(home):
 
     if formato is None:
         rs.append(error("~/.ssh/id_rsa no parece una clave privada", fallo="B7",
+                        efecto="ssh no tiene con qué entrar en las máquinas: "
+                               "«Permission denied (publickey)».",
+                        arreglo=["Apártela y genere una pareja nueva (acepte el nombre "
+                                 "que propone):",
+                                 "$ mv ~/.ssh/id_rsa ~/.ssh/id_rsa.mala",
+                                 "$ mv ~/.ssh/id_rsa.pub ~/.ssh/id_rsa.pub.mala",
+                                 "$ ssh-keygen -t rsa",
+                                 "Después ponga la nueva ~/.ssh/id_rsa.pub en user-data y "
+                                 "vuelva a crear las máquinas que ya tenga."],
                         seccion="preliminar"))
         return rs, publica
     if formato == "pem" and cifrada is False:
@@ -586,6 +708,11 @@ def comprobar_nombres(directorio):
             continue
         if not os.path.isfile(ruta):
             rs.append(error("%s no es un archivo normal" % nombre, fallo=FALLO_DE[nombre],
+                            detalle=["Es un directorio o un enlace roto."],
+                            efecto="virt-install no podrá usarlo.",
+                            arreglo=["Apártelo y cree el archivo de nuevo con nano:",
+                                     "$ mv %s %s.old" % (nombre, nombre),
+                                     "$ nano %s" % nombre],
                             seccion=SECCION_DE[nombre]))
             continue
         datos = leer_bytes(ruta)
@@ -763,7 +890,9 @@ def comprobar_user_data(texto, clave_servidor):
         return rs
     if not isinstance(datos, dict):
         rs.append(error("user-data no tiene la estructura esperada", fallo="B4",
-                        arreglo="compárelo línea a línea con el del manual.",
+                        efecto="cloud-init no creará el usuario administrador.",
+                        arreglo="compárelo línea a línea con el del manual: «users:» sin "
+                                "espacios delante y el usuario debajo, con «- name:».",
                         seccion=sec))
         return rs
 
@@ -785,6 +914,9 @@ def comprobar_user_data(texto, clave_servidor):
             detalle.append("Hay «%s:»; tiene que ser «users:»." % parecidas[0])
         rs.append(error("user-data no tiene la lista users", fallo="B4", detalle=detalle,
                         efecto="no se crea el usuario administrador.",
+                        arreglo="escriba «users:» al principio de la línea (sin espacios "
+                                "delante) y, debajo, «  - name: administrador» con el "
+                                "resto del usuario, como en el manual.",
                         seccion=sec))
         return rs
     if not isinstance(usuarios, list):
@@ -826,6 +958,8 @@ def comprobar_user_data(texto, clave_servidor):
                         detalle=["Tiene: %s" % "; ".join(sudo),
                                  "Tiene que ser: %s" % SUDO_ESPERADO],
                         efecto="sudo no funcionará como espera el manual.",
+                        arreglo="escriba la línea así, con las comillas rectas: "
+                                "«    sudo: ['%s']»." % SUDO_ESPERADO,
                         seccion=sec))
 
     grupos = admin.get("groups")
@@ -874,6 +1008,12 @@ def comprobar_claves_user_data(admin, clave_servidor):
     else:
         rs.append(error("administrador no tiene ssh_authorized_keys", fallo="B5",
                         efecto="no podrá entrar: «Permission denied (publickey)».",
+                        arreglo=["Añada estas dos líneas al final del usuario, al nivel "
+                                 "de «shell:» la primera y dos espacios más la segunda:",
+                                 "$     ssh_authorized_keys:",
+                                 "$       - <el contenido de ~/.ssh/id_rsa.pub>",
+                                 "Para ver su clave pública (una sola línea que empieza "
+                                 "por ssh-rsa): cat ~/.ssh/id_rsa.pub"],
                         seccion=sec))
         return rs
     if isinstance(valor, str):
@@ -957,6 +1097,8 @@ def comprobar_meta_data(texto, uvus, maquina):
                         detalle=["Tiene: %s" % iid],
                         efecto="si es el de otra máquina suya, puede estar "
                                "diagnosticando los archivos de esa otra máquina.",
+                        arreglo="instance-id: %s (si estos archivos son de otra máquina, "
+                                "indique esa: ./ci-diagnosis serverX)." % esperado,
                         seccion=sec))
     elif esperado:
         rs.append(ok("meta-data: instance-id %s" % iid))
@@ -965,7 +1107,9 @@ def comprobar_meta_data(texto, uvus, maquina):
                         arreglo="local-hostname: %s" % (maquina or "serverX"), seccion=sec))
     elif maquina and str(host) != maquina:
         rs.append(aviso("El local-hostname de meta-data no es %s" % maquina,
-                        detalle=["Tiene: %s" % host], seccion=sec))
+                        detalle=["Tiene: %s" % host],
+                        efecto="la máquina se llamará %s por dentro." % host,
+                        arreglo="local-hostname: %s" % maquina, seccion=sec))
     elif maquina:
         rs.append(ok("meta-data: local-hostname %s" % host))
     return rs, datos
@@ -975,6 +1119,11 @@ def comprobar_network_config(texto, red=None):
     """network-config (B6). Devuelve (resultados, IP o None)."""
     rs = []
     sec = "instanciar"
+    if red is not None:
+        base = str(red.red.network_address).rsplit(".", 1)[0]
+        ejemplo_ip, ejemplo_via = base + ".YYY/24", str(red.pasarela)
+    else:
+        ejemplo_ip, ejemplo_via = "192.168.XXX.YYY/24", "192.168.XXX.1"
     datos, problema = cargar_yaml("network-config", texto)
     if problema:
         return [problema], None
@@ -987,11 +1136,16 @@ def comprobar_network_config(texto, red=None):
                         detalle=["Tiene: version: %s" % datos.get("version")]
                         if "version" in datos else [],
                         efecto="cloud-init lo interpreta con otro formato.",
+                        arreglo="la primera línea es «version: 2», sin espacios delante.",
                         seccion=sec))
     ethernets = datos.get("ethernets")
     if not isinstance(ethernets, dict):
         rs.append(error("network-config no tiene el bloque ethernets", fallo="B6",
-                        efecto="la máquina no tendrá su IP fija.", seccion=sec))
+                        efecto="la máquina no tendrá su IP fija.",
+                        arreglo="debajo de «version: 2», «ethernets:» sin espacios "
+                                "delante y, dentro, «  %s:» con su dirección, su ruta y "
+                                "sus DNS, como en el manual." % INTERFAZ,
+                        seccion=sec))
         return rs, None
     if INTERFAZ not in ethernets:
         rs.append(error("network-config no configura la interfaz %s" % INTERFAZ, fallo="B6",
@@ -1003,16 +1157,25 @@ def comprobar_network_config(texto, red=None):
     iface = ethernets[INTERFAZ]
     if not isinstance(iface, dict):
         rs.append(error("El bloque de %s está vacío o mal indentado" % INTERFAZ, fallo="B6",
+                        efecto="la máquina no tendrá su IP fija.",
+                        arreglo="addresses, routes y nameservers van dentro de «%s:», "
+                                "con dos espacios más que ella, como en el manual." % INTERFAZ,
                         seccion=sec))
         return rs, None
 
     direcciones = [str(d) for d in _como_lista(iface.get("addresses"))]
     if not direcciones:
         rs.append(error("network-config no tiene addresses", fallo="B6",
-                        efecto="la máquina no tendrá su IP fija.", seccion=sec))
+                        efecto="la máquina no tendrá su IP fija.",
+                        arreglo="dentro de %s: «addresses:» y, debajo, «- %s», con YYY "
+                                "entre 2 y 127 (distinta en cada máquina)." % (INTERFAZ, ejemplo_ip),
+                        seccion=sec))
         return rs, None
     if len(direcciones) > 1:
         rs.append(aviso("network-config tiene varias direcciones; el manual usa una",
+                        detalle=["Tiene: %s" % ", ".join(direcciones)],
+                        efecto="se revisa solo la primera.",
+                        arreglo="deje solo una: «- %s» debajo de «addresses:»." % direcciones[0],
                         seccion=sec))
     if "/" not in direcciones[0]:
         rs.append(error("La dirección %s no lleva /24" % direcciones[0], fallo="B6",
@@ -1023,13 +1186,20 @@ def comprobar_network_config(texto, red=None):
         interfaz = ipaddress.ip_interface(direcciones[0])
     except ValueError:
         rs.append(error("%s no es una dirección IP válida" % direcciones[0], fallo="B6",
+                        efecto="la máquina no tendrá su IP fija.",
+                        arreglo="«addresses:» y, debajo, «- %s», con YYY entre 2 y 127." % ejemplo_ip,
                         seccion=sec))
         return rs, None
     ip = interfaz.ip
     if interfaz.network.prefixlen != 24:
-        rs.append(aviso("La dirección %s no es /24" % direcciones[0], seccion=sec))
+        rs.append(aviso("La dirección %s no es /24" % direcciones[0],
+                        efecto="la máquina no tendrá la máscara de su red.",
+                        arreglo="escríbala así: %s/24" % ip, seccion=sec))
     if iface.get("dhcp4") in (True, "true", "yes"):
-        rs.append(aviso("network-config activa dhcp4 además de la IP fija", seccion=sec))
+        rs.append(aviso("network-config activa dhcp4 además de la IP fija",
+                        efecto="la máquina puede tener dos IP, y la del DHCP cambia.",
+                        arreglo="quite la línea dhcp4 (el manual no la lleva).",
+                        seccion=sec))
 
     via = None
     for ruta in _como_lista(iface.get("routes")):
@@ -1044,24 +1214,33 @@ def comprobar_network_config(texto, red=None):
     if via is None:
         rs.append(error("network-config no tiene la ruta por defecto", fallo="B6",
                         efecto="la máquina no saldrá de su red (apt update fallará).",
+                        arreglo="dentro de %s, como en el manual: «routes:» y, debajo, "
+                                "«  - to: default» y «    via: %s»." % (INTERFAZ, ejemplo_via),
                         seccion=sec))
     else:
         try:
             pasarela = ipaddress.ip_address(str(via))
         except ValueError:
             rs.append(error("La pasarela %s no es una dirección IP" % via, fallo="B6",
-                            seccion=sec))
+                            efecto="la máquina no saldrá de su red.",
+                            arreglo="via: %s" % ejemplo_via, seccion=sec))
 
     dns = [str(d) for d in _como_lista((iface.get("nameservers") or {}).get("addresses"))
            ] if isinstance(iface.get("nameservers"), dict) else []
     if not dns:
         rs.append(aviso("network-config no tiene servidores DNS",
                         efecto="la máquina no podrá resolver nombres (apt update fallará).",
-                        arreglo="añada el bloque nameservers del manual.", seccion=sec))
+                        arreglo="dentro de %s, como en el manual: «nameservers:», «addresses:» "
+                                "y una línea «- IP» por cada uno: %s."
+                                % (INTERFAZ, " y ".join(DNS_ESPERADOS)), seccion=sec))
     elif set(dns) != set(DNS_ESPERADOS):
         rs.append(aviso("Los DNS de network-config no son los del manual",
                         detalle=["Tiene: %s" % ", ".join(dns),
                                  "El manual: %s" % ", ".join(DNS_ESPERADOS)],
+                        efecto="si no funcionan, la máquina no resolverá nombres (apt "
+                               "update fallará).",
+                        arreglo="dentro de nameservers, «addresses:» y, debajo, una línea "
+                                "«- IP» por cada uno: %s." % " y ".join(DNS_ESPERADOS),
                         seccion=sec))
 
     if red is None:
@@ -1071,16 +1250,18 @@ def comprobar_network_config(texto, red=None):
     if ip not in red.red:
         rs.append(error("La IP %s no es de su red %s (%s)" % (ip, red.nombre, red.red),
                         fallo="B6", efecto="no podrá llegar a la máquina.",
-                        arreglo="use una IP de %s, entre la .2 y la .127." % red.red,
+                        arreglo="«addresses:» y, debajo, «- %s», con YYY entre 2 y 127." % ejemplo_ip,
                         seccion=sec))
     elif ip in (red.red.network_address, red.red.broadcast_address, red.pasarela):
         rs.append(error("La IP %s está reservada en su red" % ip, fallo="B6",
-                        arreglo="use una entre la .2 y la .127.", seccion=sec))
+                        arreglo="«addresses:» y, debajo, «- %s», con YYY entre 2 y 127." % ejemplo_ip,
+                        seccion=sec))
     elif red.en_dhcp(ip):
         rs.append(aviso("La IP %s está dentro del rango del DHCP (%s)" % (ip, rango),
                         fallo="B6",
                         efecto="el DHCP puede dársela también a otra máquina.",
-                        arreglo="use una entre la .2 y la .127.", seccion="red"))
+                        arreglo="«addresses:» y, debajo, «- %s», con YYY entre 2 y 127." % ejemplo_ip,
+                        seccion="red"))
     else:
         rs.append(ok("IP %s: de su red y fuera del DHCP" % ip))
     if pasarela is not None:
@@ -1101,7 +1282,6 @@ def comprobar_network_config(texto, red=None):
 # por los nombres de los silos, que no identifican al dueño (catálogo, sección 0).
 
 URI = "qemu:///system"
-IMAGEN_BASE = "noble-server-cloudimg-amd64.img"
 TAM_IMAGEN_BASE = 3758096384          # 3.5 GiB (manual, 5.4.1)
 TAM_DISCO = 40 * 1024 ** 3            # 40 GiB (manual, 5.4.2)
 USUARIO_QEMU = "libvirt-qemu"
@@ -1273,7 +1453,13 @@ def comprobar_silo(silos, uvus, home, directorio):
                 rs.append(ok("%s es su silo %s" % (directorio, s.nombre)))
             else:
                 rs.append(aviso("El silo de %s se llama %s, no %s" % (
-                    directorio, s.nombre, nombre_esperado), seccion="silo"))
+                    directorio, s.nombre, nombre_esperado),
+                    efecto="ninguno si funciona: solo se aparta del nombre del manual.",
+                    arreglo="no hace falta cambiarlo. Si quiere el nombre del manual: "
+                            "virsh pool-destroy %s && virsh pool-undefine %s, y defínalo "
+                            "de nuevo como en la sección 5.2 (no borra sus archivos)."
+                            % (s.nombre, s.nombre),
+                    seccion="silo"))
             if not s.activo:
                 rs.append(error("El silo %s está parado" % s.nombre, fallo="B2",
                                 efecto="virt-install no lo reconocerá como silo.",
@@ -1284,7 +1470,12 @@ def comprobar_silo(silos, uvus, home, directorio):
                                 arreglo="virsh pool-autostart %s" % s.nombre,
                                 seccion="silo"))
         if dir_r != esperado:
-            rs.append(aviso("Según el manual, su silo es ~/imagenesMV", seccion="silo"))
+            rs.append(aviso("Según el manual, su silo es ~/imagenesMV",
+                            efecto="ninguno si funciona; las soluciones de esta revisión "
+                                   "dicen «cd ~/imagenesMV»: use su directorio.",
+                            arreglo="no hace falta cambiarlo; trabaje siempre desde %s."
+                                    % directorio,
+                            seccion="silo"))
 
     # Dueño y escritura del directorio actual (B9: si lo creó libvirt, es de root)
     try:
@@ -1316,6 +1507,14 @@ def comprobar_silo(silos, uvus, home, directorio):
             rs.append(aviso("Su silo %s no apunta a %s" % (s.nombre, directorio),
                             fallo="B9", detalle=detalle,
                             efecto="los archivos de este directorio no están en él.",
+                            arreglo=("trabaje desde el directorio de su silo: cd %s"
+                                     % s.ruta) if os.path.isdir(s.ruta or "") else
+                            ["Defina el silo de nuevo sobre el directorio correcto (no "
+                             "borra archivos):",
+                             "$ virsh pool-destroy %s" % s.nombre,
+                             "$ virsh pool-undefine %s" % s.nombre,
+                             "y créelo otra vez como en la sección 5.2, desde %s."
+                             % directorio],
                             seccion="silo"))
 
     # Silos sobre su home entero o sobre su .ssh (sección 0)
@@ -1398,20 +1597,48 @@ def comprobar_red(conn, uvus):
                         arreglo="virsh net-autostart %s" % nombre, seccion="red"))
     if red.modo != "nat":
         rs.append(aviso("La red %s no es de tipo NAT" % nombre,
-                        detalle=["Modo: %s" % (red.modo or "aislada")], seccion="red"))
+                        detalle=["Modo: %s" % (red.modo or "aislada")],
+                        efecto="sin NAT, las máquinas no salen a Internet (apt update "
+                               "fallará).",
+                        arreglo=["No hace falta si sus máquinas funcionan. Para dejarla como el manual, "
+                          "con sus máquinas apagadas, elimínela y créela de nuevo como en "
+                          "la sección 5.3 (con el mismo nombre y el mismo XXX):",
+                          "$ virsh net-destroy %s" % nombre,
+                          "$ virsh net-undefine %s" % nombre],
+                        seccion="red"))
     if red.red.prefixlen != 24 or red.pasarela != red.red.network_address + 1:
         rs.append(aviso("La red %s no es como la del manual" % nombre,
                         detalle=["Tiene %s con pasarela %s; el manual usa "
                                  "192.168.XXX.0/24 con pasarela .1." % (red.red, red.pasarela)],
+                        efecto="las IP y la pasarela del manual (192.168.XXX.YYY/24, vía "
+                               ".1) no le sirven: use las de su red.",
+                        arreglo=["No hace falta si sus máquinas funcionan. Para dejarla como el manual, "
+                          "con sus máquinas apagadas, elimínela y créela de nuevo como en "
+                          "la sección 5.3 (con el mismo nombre y el mismo XXX):",
+                          "$ virsh net-destroy %s" % nombre,
+                          "$ virsh net-undefine %s" % nombre],
                         seccion="red"))
     esperado = [(red.red.network_address + 128, red.red.network_address + 254)]
     if red.red.prefixlen == 24 and red.dhcp != esperado:
         rs.append(aviso("El DHCP de la red %s no es el del manual (de .128 a .254)" % nombre,
                         detalle=["Tiene: %s." % ", ".join("%s-%s" % r for r in red.dhcp)
                                  if red.dhcp else "Sin DHCP."],
+                        efecto="si el DHCP reparte las IP de la .2 a la .127, puede dar a "
+                               "otra máquina la IP fija de una de las suyas.",
+                        arreglo=["No hace falta si sus máquinas funcionan. Para dejarla como el manual, "
+                          "con sus máquinas apagadas, elimínela y créela de nuevo como en "
+                          "la sección 5.3 (con el mismo nombre y el mismo XXX):",
+                          "$ virsh net-destroy %s" % nombre,
+                          "$ virsh net-undefine %s" % nombre],
                         seccion="red"))
     if red.ipv6:
         rs.append(aviso("La red %s tiene IPv6; el manual no lo activa" % nombre,
+                        efecto="ninguno conocido.",
+                        arreglo=["No hace falta si sus máquinas funcionan. Para dejarla como el manual, "
+                          "con sus máquinas apagadas, elimínela y créela de nuevo como en "
+                          "la sección 5.3 (con el mismo nombre y el mismo XXX):",
+                          "$ virsh net-destroy %s" % nombre,
+                          "$ virsh net-undefine %s" % nombre],
                         seccion="red"))
 
     # A2: otra red del servidor con la misma subred
@@ -1480,7 +1707,12 @@ def comprobar_imagen_y_disco(directorio, maquina):
     else:
         info, problema = info_imagen(base)
         if info is None:
-            rs.append(aviso("No se ha podido leer la imagen base: %s" % problema))
+            rs.append(aviso("No se ha podido leer la imagen base: %s" % problema,
+                            efecto="si está dañada, la máquina no arrancará.",
+                            arreglo="compruebe que es suya y que puede leerla (ls -l %s). "
+                                    "Si no, descárguela de nuevo en el silo, sin cambiarle "
+                                    "el nombre." % IMAGEN_BASE,
+                            seccion="preliminar"))
         elif info.get("format") != "qcow2":
             rs.append(error("La imagen base no está en formato qcow2", fallo="B3",
                             detalle=["Formato: %s" % info.get("format")],
@@ -1490,6 +1722,8 @@ def comprobar_imagen_y_disco(directorio, maquina):
             rs.append(aviso("La imagen base no mide 3.5 GiB", fallo="B3",
                             detalle=["Tamaño virtual: %s bytes" % info.get("virtual-size")],
                             efecto="si Canonical ha cambiado la imagen, puede ser normal.",
+                            arreglo="compruebe que descargó la de Ubuntu 24.04 (noble) "
+                                    "del manual; si no, descárguela de nuevo.",
                             seccion="preliminar"))
         else:
             rs.append(ok("Imagen base: qcow2 de 3.5 GiB"))
@@ -1501,17 +1735,34 @@ def comprobar_imagen_y_disco(directorio, maquina):
         return rs
     nombre = "%s.qcow2" % maquina
     disco = os.path.join(directorio, nombre)
-    crear = ("qemu-img create %s -f qcow2 -b %s -F qcow2 40G" % (nombre, IMAGEN_BASE))
     if not os.path.exists(disco):
         rs.append(error("No existe el disco %s" % nombre, fallo="B3",
                         efecto="virt-install dirá «Size must be specified for non existent "
                                "volume '%s'»." % nombre,
-                        arreglo=crear, seccion="instanciar"))
+                        arreglo=orden_crear_disco(maquina), seccion="instanciar"))
         return rs
+    r, _ = comprobar_disco_cow(disco, maquina, existe_maquina=False)
+    return rs + r
+
+
+def comprobar_disco_cow(disco, maquina, existe_maquina):
+    """B3: el disco de la máquina (formato, tamaño y respaldo), con qemu-img info.
+
+    existe_maquina: si la máquina ya está creada, arreglar el disco es volver a
+    crearla entera. Devuelve (resultados, falta la imagen de la que depende)."""
+    rs = []
+    nombre = os.path.basename(disco)
+    crear = orden_crear_disco(maquina)
     info, problema = info_imagen(disco)
     if info is None:
-        rs.append(aviso("No se ha podido leer %s: %s" % (nombre, problema)))
-        return rs
+        rs.append(aviso("No se ha podido leer %s: %s" % (nombre, problema),
+                        efecto="si está dañado, la máquina no arrancará.",
+                        arreglo="compruebe que es suyo y que puede leerlo (ls -l %s). %s"
+                                % (disco, "Si está dañado, vuelva a crear la máquina."
+                                   if existe_maquina else
+                                   "Si está dañado, bórrelo y créelo de nuevo: " + crear),
+                        seccion="instanciar"))
+        return rs, False
     malos = []
     if info.get("format") != "qcow2":
         malos.append("formato %s, no qcow2" % info.get("format"))
@@ -1527,21 +1778,34 @@ def comprobar_imagen_y_disco(directorio, maquina):
     if malos:
         rs.append(error("El disco %s no es como el del manual" % nombre, fallo="B3",
                         detalle=[m[0].upper() + m[1:] + "." for m in malos],
-                        arreglo="bórrelo y vuelva a crearlo: %s" % crear,
+                        efecto="la máquina puede no arrancar o quedarse sin espacio.",
+                        arreglo=pasos_rehacer() if existe_maquina else
+                        ["Bórrelo y créelo de nuevo, desde ~/imagenesMV:",
+                         "$ rm %s" % nombre, "$ " + crear],
                         seccion="instanciar"))
     else:
         rs.append(ok("%s: qcow2 de 40 GiB, copia COW de %s" % (nombre, IMAGEN_BASE)))
+    falta = False
     if respaldo is not None:
-        completo = info.get("full-backing-filename") or os.path.join(directorio, respaldo)
+        completo = info.get("full-backing-filename") or os.path.join(
+            os.path.dirname(disco), respaldo)
         if not os.path.exists(completo):
-            rs.append(error("No está la imagen de la que depende %s" % nombre, fallo="B3",
-                            detalle=["Respaldo: %s" % completo],
-                            efecto="la máquina no podrá arrancar.",
-                            arreglo="la imagen base no se puede mover ni renombrar.",
+            falta = True
+            # Visto en avantasia (6-nov): virsh start dice «Cannot access backing
+            # file ... No such file or directory», y guestfish no puede leer el disco
+            rs.append(error("No está la imagen de la que depende el disco %s" % nombre,
+                            fallo="B3", detalle=["Respaldo: %s" % completo],
+                            efecto="la máquina no puede arrancar («Cannot access backing "
+                                   "file ... No such file or directory») y su disco no se "
+                                   "puede leer.",
+                            arreglo="devuelva la imagen base a ese sitio, con ese nombre "
+                                    "(mv ... %s): la imagen base no se puede mover ni "
+                                    "renombrar mientras haya discos que dependan de ella."
+                                    % completo,
                             seccion="instanciar"))
     if _escribible_por_otros(disco):
         rs.append(_aviso_escribible(disco, nombre))
-    return rs
+    return rs, falta
 
 
 def discos_de(dominio):
@@ -1595,7 +1859,10 @@ def comprobar_nombres_libres(conn, uvus, home, directorio, maquina, ip=None, red
                                 efecto="virt-install dirá «Disk ... is already in use "
                                        "by other guests» si la otra está encendida; si está "
                                        "apagada, las dos acabarán estropeando el disco.",
-                                arreglo="cree un disco nuevo para esta máquina.",
+                                arreglo=["Cada máquina necesita su propio disco. Cree uno "
+                                         "nuevo para esta (con otro nombre si el otro "
+                                         "sigue en uso) y póngalo en --disk path=:",
+                                         "$ " + orden_crear_disco(maquina)],
                                 seccion="instanciar"))
 
     # Máquinas suyas (por los discos) sin el UVUS en el nombre
@@ -1608,13 +1875,20 @@ def comprobar_nombres_libres(conn, uvus, home, directorio, maquina, ip=None, red
                                 efecto="la creó un virt-install con «-noautoconsole» (un "
                                        "solo guion): virt-install lo entiende como "
                                        "«--name oautoconsole».",
-                                arreglo="elimínela; las opciones llevan dos guiones.",
+                                arreglo=["Elimínela con su disco y repita virt-install con "
+                                         "--noautoconsole (dos guiones):",
+                                         "$ virsh destroy oautoconsole",
+                                         "$ virsh undefine oautoconsole --remove-all-storage",
+                                         "Eso borra también su disco: créelo de nuevo.",
+                                         "$ " + orden_crear_disco(maquina)],
                                 seccion="instanciar"))
             else:
                 rs.append(aviso("La máquina %s usa un disco suyo y no lleva su UVUS" % d.name(),
                                 fallo="A3",
                                 efecto="todos comparten la conexión: un nombre sin UVUS "
                                        "puede chocar con el de otro.",
+                                arreglo="renómbrela con la máquina apagada: virsh domrename "
+                                        "%s %s-%s" % (d.name(), uvus, d.name()),
                                 seccion="instanciar"))
 
     # D5: algo responde ya en la IP de network-config
@@ -1768,8 +2042,9 @@ def comprobar_maquina(maquina, uvus):
         rs.append(error("La máquina no está conectada a su red %s" % red,
                         detalle=["Está en: %s." % ", ".join(maquina.redes)]
                         if maquina.redes else ["No tiene ninguna red."],
-                        efecto="la IP de network-config no le sirve en esa red.",
-                        arreglo="vuelva a crearla con --network network=%s." % red,
+                        efecto="la IP de network-config no le sirve en esa red: no podrá "
+                               "llegar a la máquina.",
+                        arreglo=pasos_rehacer(),
                         seccion="instanciar"))
     else:
         rs.append(ok("Está conectada a su red %s" % red))
@@ -1783,9 +2058,20 @@ def comprobar_maquina(maquina, uvus):
             seccion="acceso"))
     if maquina.memoria_mib is not None and maquina.memoria_mib != 2048:
         rs.append(aviso("La máquina tiene %d MiB de RAM; el manual pide 2048"
-                        % maquina.memoria_mib, seccion="instanciar"))
+                        % maquina.memoria_mib,
+                        efecto="con menos memoria puede ir lenta o no arrancar bien.",
+                        arreglo=["No hace falta volver a crearla. Con la máquina apagada:",
+                                 "$ virsh setmaxmem %s 2048M --config" % maquina.nombre,
+                                 "$ virsh setmem %s 2048M --config" % maquina.nombre,
+                                 "y arránquela: virsh start %s" % maquina.nombre],
+                        seccion="instanciar"))
     if maquina.vcpus is not None and maquina.vcpus != 2:
         rs.append(aviso("La máquina tiene %d vCPU; el manual pide 2" % maquina.vcpus,
+                        efecto="ninguno grave: solo se aparta del manual.",
+                        arreglo=["No hace falta volver a crearla. Con la máquina apagada:",
+                                 "$ virsh setvcpus %s 2 --config --maximum" % maquina.nombre,
+                                 "$ virsh setvcpus %s 2 --config" % maquina.nombre,
+                                 "y arránquela: virsh start %s" % maquina.nombre],
                         seccion="instanciar"))
     return rs
 
@@ -1827,32 +2113,53 @@ def comprobar_conectividad(ip):
         rs.append(ok("La máquina responde en %s" % ip))
     else:
         rs.append(aviso("La máquina no responde al ping en %s" % ip,
-                        efecto="o todavía está arrancando, o no tiene esa IP."))
+                        efecto="o todavía está arrancando, o no tiene esa IP.",
+                        arreglo="si acaba de crearla o de arrancarla, espere un minuto y "
+                                "repita. Si sigue igual, mire abajo el puerto 22 y el "
+                                "bloque 5 (network-config)."))
     puerto = probar_puerto(ip)
     if puerto == "abierto":
         rs.append(ok("El puerto 22 (ssh) está abierto"))
         return rs, True
     espere = "Si acaba de crearla o de arrancarla, espere medio minuto y repita."
     if puerto == "rechazado":
+        causa = "si cloud-init falló al arrancar."
         rs.append(error("La máquina rechaza la conexión al puerto 22", fallo="D1",
                         detalle=["ssh dice «Connection refused».",
                                  "Quien rechaza es la máquina virtual, no el servidor de la "
                                  "asignatura.", espere],
                         efecto="la máquina tiene la IP, pero ssh todavía no escucha "
                                "(o la máquina se ha quedado en modo de emergencia).",
+                        arreglo=["Si acaba de crearla o de arrancarla, espere un minuto y repita.",
+                                 "Si sigue igual, apáguela y vuelva a ejecutar "
+                                 "./ci-diagnosis: con la máquina apagada se revisa su "
+                                 "disco, y se ve %s" % causa,
+                                 "$ virsh shutdown %s" % nombre_de_maquina()],
                         seccion="acceso"))
     elif puerto == "sin ruta":
+        causa = "qué red le configuró cloud-init (B6)."
         rs.append(error("No hay ruta hasta %s" % ip, fallo="D1",
                         detalle=["ssh dice «No route to host».", espere],
                         efecto="nada responde en esa IP: la máquina aún arranca, o "
                                "network-config no le ha dado esa IP (B6).",
+                        arreglo=["Si acaba de crearla o de arrancarla, espere un minuto y repita.",
+                                 "Si sigue igual, apáguela y vuelva a ejecutar "
+                                 "./ci-diagnosis: con la máquina apagada se revisa su "
+                                 "disco, y se ve %s" % causa,
+                                 "$ virsh shutdown %s" % nombre_de_maquina()],
                         seccion="acceso"))
     else:
+        causa = "qué red le configuró cloud-init (B6)."
         rs.append(error("La máquina no contesta en el puerto 22 de %s" % ip, fallo="D1",
                         detalle=["ssh dice «Connection timed out» (o, si se espera más, "
                                  "«No route to host»).", espere],
                         efecto="nada responde en esa IP: la máquina aún arranca, o "
                                "network-config no le ha dado esa IP (B6).",
+                        arreglo=["Si acaba de crearla o de arrancarla, espere un minuto y repita.",
+                                 "Si sigue igual, apáguela y vuelva a ejecutar "
+                                 "./ci-diagnosis: con la máquina apagada se revisa su "
+                                 "disco, y se ve %s" % causa,
+                                 "$ virsh shutdown %s" % nombre_de_maquina()],
                         seccion="acceso"))
     return rs, False
 
@@ -1890,8 +2197,13 @@ def _aviso_d5(ip, otra, esperado):
                  fallo="D5",
                  efecto="probablemente otra máquina suya tiene la misma IP; con las dos "
                         "encendidas, ssh entra unas veces en una y otras en la otra.",
-                 arreglo="dé a cada máquina una IP distinta en su network-config (o "
-                         "apague la otra).", seccion="instanciar")
+                 arreglo=["Dos máquinas no pueden tener la misma IP. Lo más rápido: "
+                          "apague la otra (virsh shutdown NOMBRE; virsh list --all le dice "
+                          "cuáles tiene). Para usar las dos a la vez, una de ellas necesita "
+                          "otra IP:"] + pasos_rehacer(
+                              "Ponga en su network-config una IP que no use ninguna otra "
+                              "máquina suya (YYY entre 2 y 127)."),
+                 seccion="instanciar")
 
 
 def comprobar_ssh(ip, home, cifrada, en_agente, esperado=None):
@@ -1910,10 +2222,16 @@ def comprobar_ssh(ip, home, cifrada, en_agente, esperado=None):
         if otra:
             rs.append(_aviso_d5(ip, otra, esperado))
             return rs, False
-        rs.append(ok("Puede entrar: ssh %s@%s funciona" % (USUARIO_VM, ip)))
+        rs.append(ok("Puede entrar: ssh %s@%s funciona" % (USUARIO_VM, ip),
+                     detalle=["Si a usted no le deja, compruebe que lo ejecuta en el "
+                              "servidor (no en su ordenador) y que escribe exactamente "
+                              "ssh %s@%s: ni ubuntu ni su UVUS." % (USUARIO_VM, ip)]))
         return rs, True
     if codigo is None:
-        rs.append(aviso("ssh no ha terminado a tiempo", seccion="acceso"))
+        rs.append(aviso("ssh no ha terminado a tiempo",
+                        efecto="no se sabe si puede entrar.",
+                        arreglo="repita dentro de un minuto, o pruébelo a mano: ssh %s@%s"
+                                % (USUARIO_VM, ip), seccion="acceso"))
         return rs, False
     if "REMOTE HOST IDENTIFICATION HAS CHANGED" in err:
         rs.append(error(
@@ -1941,12 +2259,21 @@ def comprobar_ssh(ip, home, cifrada, en_agente, esperado=None):
                 "La máquina rechaza su clave: «Permission denied (publickey)»", fallo="B5",
                 efecto="lo que falla está en lo que cloud-init instaló en la máquina "
                        "(usuario o clave).",
-                arreglo="apague la máquina (virsh shutdown) y vuelva a ejecutar "
-                        "ci-diagnosis: con la máquina apagada se revisa su disco.",
+                arreglo=["Apague la máquina y, cuando esté apagada, vuelva a ejecutar "
+                         "./ci-diagnosis: con la máquina apagada se revisa su disco y se ve "
+                         "qué usuario y qué clave le instaló cloud-init.",
+                         "$ virsh shutdown %s" % nombre_de_maquina(),
+                         "$ virsh domstate %s" % nombre_de_maquina(),
+                         "(tiene que decir «shut off»)"],
                 seccion="faq-publickey"))
     else:
         ultima = [l for l in err.strip().splitlines() if l.strip()][-1:] or ["(sin mensaje)"]
         rs.append(error("ssh no ha podido entrar", detalle=["ssh dice: %s" % ultima[0]],
+                        arreglo=["Pruébelo a mano con más detalle y fíjese en las "
+                                 "últimas líneas:",
+                                 "$ ssh -v %s@%s" % (USUARIO_VM, ip),
+                                 "Si no lo entiende, pregunte en el chat de dudas con esas "
+                                 "líneas y esta salida."],
                         seccion="acceso"))
     return rs, False
 
@@ -2020,51 +2347,180 @@ def _valor(palabras, opcion):
     return None
 
 
-def comprobar_orden(home, uvus, nombre, intento=None):
+# Errores de virt-install que se conocen (grabados en los servidores), con su arreglo
+ERRORES_VIRT_INSTALL = (
+    ("is already in use", "C2", "la máquina (o el disco) ya existe. Si quiere volver a "
+     "crearla, elimine antes la que hay; si lo que pasa es que no puede entrar, use "
+     "./ci-diagnosis --acceso."),
+    ("Size must be specified for non existent volume", "B3",
+     "no existe el disco de --disk path=: créelo antes con qemu-img create, desde "
+     "~/imagenesMV (./ci-diagnosis --antes le da la orden)."),
+    ("Permission denied", "B8", "QEMU no puede llegar al disco: ./ci-diagnosis --antes "
+     "le dice qué directorio tiene que abrir (chmod o+x)."),
+    ("codec can't decode", "A1", "un silo del servidor tiene un archivo con un nombre "
+     "que no es UTF-8: ./ci-diagnosis --antes le dice cuál; si no es suyo, avise al "
+     "profesor."),
+    ("Cannot access backing file", "B3", "la imagen base no está donde estaba al crear "
+     "el disco: devuélvala a su sitio, con su nombre."),
+)
+
+
+def _arreglo_de_error(mensaje):
+    for patron, fallo, arreglo in ERRORES_VIRT_INSTALL:
+        if patron in mensaje:
+            return fallo, arreglo
+    return None, ("lea el mensaje: dice qué opción o qué archivo falla. Corríjalo y "
+                  "vuelva a ejecutar la orden del manual: " + orden_virt_install())
+
+
+def _ruta_de_disk(valor):
+    """path=serverX.qcow2,... → serverX.qcow2"""
+    for parte in (valor or "").split(","):
+        if parte.startswith("path="):
+            return parte[len("path="):]
+    primera = (valor or "").split(",")[0]
+    return primera if "=" not in primera else None
+
+
+def comprobar_orden(home, uvus, nombre, intento=None, existe=True):
+    """C1: la última orden de virt-install para esa máquina, frente a la del manual.
+
+    existe: si la máquina está creada (entonces corregir la orden es volver a
+    crearla) o no (basta con ejecutar la orden buena)."""
     intento = intento or ultimo_intento(home, nombre)
     if intento is None:
         return [omitida("Orden de virt-install: no está en su registro "
-                        "(~/.cache/virt-manager/virt-install.log)")]
+                        "(~/.cache/virt-manager/virt-install.log): no la creó con "
+                        "virt-install en esta cuenta, o el registro ya no la guarda")]
     palabras = intento.palabras
-    rs = []
+    maquina = nombre.split("-", 1)[1] if "-" in nombre else nombre
+    manual = orden_virt_install(uvus, maquina)
     sec = "instanciar"
-    if intento.errores:
-        rs.append(error("virt-install terminó con un error (%s)" % intento.fecha,
-                        detalle=["virt-install: %s" % e[:300] for e in intento.errores[:3]],
-                        seccion=sec))
+    rs = [ok("La orden que ejecutó (%s):" % intento.fecha,
+             detalle=["virt-install " + " ".join(palabras[1:])])]
+    graves = []      # los que obligan a repetir la orden (o a rehacer la máquina)
+    menores = []     # los que solo se apartan del manual
+
+    for e in intento.errores[:3]:
+        fallo, arreglo = _arreglo_de_error(e)
+        rs.append(error("virt-install terminó con un error", fallo=fallo,
+                        detalle=["virt-install dijo: %s" % e[:300]],
+                        efecto="no creó la máquina.", arreglo=arreglo, seccion=sec))
+
     un_guion = [p for p in palabras[1:] if re.match(r"^-[a-z]{2,}", p)]
     if un_guion:
-        rs.append(error("La orden tiene opciones con un solo guion: %s" % " ".join(un_guion),
-                        fallo="C1", efecto="virt-install las entiende como otra cosa "
-                        "(-noautoconsole es --name oautoconsole).",
-                        arreglo="todas las opciones empiezan por dos guiones.", seccion=sec))
+        graves.append(error(
+            "La orden tiene opciones con un solo guion: %s" % " ".join(un_guion),
+            fallo="C1", efecto="virt-install las entiende como otra cosa "
+            "(-noautoconsole es --name oautoconsole).",
+            arreglo="todas las opciones empiezan por dos guiones: %s."
+                    % ", ".join("-" + p for p in un_guion), seccion=sec))
+
     ci = _valor(palabras, "--cloud-init")
     sueltas = [p for p in palabras if re.match(r"^(user-data|meta-data|network-config)=", p)
                and p != ci]
     if ci is None:
-        rs.append(error("La orden no lleva --cloud-init", fallo="C1",
-                        efecto="cloud-init no recibió ninguno de los tres archivos.",
-                        seccion=sec))
+        graves.append(error(
+            "La orden no lleva --cloud-init", fallo="C1",
+            efecto="cloud-init no recibió ninguno de los tres archivos: la máquina no "
+                   "tiene el usuario administrador ni su IP.",
+            arreglo="--cloud-init user-data=user-data,meta-data=meta-data,"
+                    "network-config=network-config", seccion=sec))
     else:
         faltan = [a for a in ARCHIVOS_CI if a + "=" not in ci]
         if sueltas:
-            rs.append(error("Hay un espacio tras una coma en --cloud-init", fallo="C1",
-                            detalle=["Sueltos: %s" % " ".join(sueltas)],
-                            efecto="virt-install no los toma como parte de --cloud-init.",
-                            arreglo="los tres, separados por comas y sin espacios.",
-                            seccion=sec))
+            graves.append(error(
+                "Hay un espacio tras una coma en --cloud-init", fallo="C1",
+                detalle=["Sueltos: %s" % " ".join(sueltas)],
+                efecto="virt-install no los toma como parte de --cloud-init.",
+                arreglo="los tres, separados por comas y sin espacios: --cloud-init "
+                        "user-data=user-data,meta-data=meta-data,"
+                        "network-config=network-config", seccion=sec))
         elif faltan:
-            rs.append(error("--cloud-init no lleva %s" % ", ".join(faltan), fallo="C1",
-                            efecto="cloud-init no recibió ese archivo.", seccion=sec))
+            graves.append(error(
+                "--cloud-init no lleva %s" % ", ".join(faltan), fallo="C1",
+                efecto="cloud-init no recibió ese archivo%s." % (
+                    ": la máquina no tiene su IP fija" if "network-config" in faltan
+                    else ": la máquina no tiene el usuario administrador"
+                    if "user-data" in faltan else ""),
+                arreglo="--cloud-init user-data=user-data,meta-data=meta-data,"
+                        "network-config=network-config", seccion=sec))
+        else:
+            otros = []
+            for parte in ci.split(","):
+                clave, _, valor = parte.partition("=")
+                if clave in ARCHIVOS_CI and os.path.basename(valor) != clave:
+                    otros.append("%s=%s" % (clave, valor))
+            if otros:
+                menores.append(aviso(
+                         "--cloud-init no usa los archivos %s" % ", ".join(ARCHIVOS_CI),
+                         detalle=["Usa: %s" % ", ".join(otros)],
+                         efecto="la máquina se creó con esos archivos, y el bloque 5 revisa "
+                                "los de nombre exacto: puede que no sean los mismos.",
+                         arreglo="revise también esos archivos, o use los del manual.",
+                         seccion=sec))
+
     if "--import" not in palabras:
-        rs.append(aviso("La orden no lleva --import", fallo="C1", seccion=sec))
-    if _valor(palabras, "--os-variant") is None and _valor(palabras, "--osinfo") is None:
-        rs.append(aviso("La orden no lleva --os-variant", fallo="C1", seccion=sec))
+        menores.append(aviso("La orden no lleva --import", fallo="C1",
+                                  arreglo="añada --import: la máquina arranca del disco, que "
+                                          "ya tiene Ubuntu.", seccion=sec))
+    variante = _valor(palabras, "--os-variant") or _valor(palabras, "--osinfo")
+    if variante is None:
+        menores.append(aviso("La orden no lleva --os-variant", fallo="C1",
+                                  arreglo="añada --os-variant=ubuntu24.04.", seccion=sec))
+    elif variante != "ubuntu24.04":
+        menores.append(aviso("La orden lleva --os-variant=%s; el manual, ubuntu24.04" % variante,
+                             efecto="ninguno grave: libvirt ajusta el hardware virtual a ese "
+                                    "sistema.", arreglo="--os-variant=ubuntu24.04", seccion=sec))
     red = _valor(palabras, "--network")
-    if red is not None and "network=%s-red" % uvus not in red:
-        rs.append(aviso("La orden conecta la máquina a otra red: %s" % red, fallo="C1",
-                        seccion=sec))
-    if not rs:
+    if red is None:
+        graves.append(aviso("La orden no lleva --network", fallo="C1",
+                            efecto="la máquina queda en la red default, no en la suya: "
+                                   "la IP de network-config no le sirve.",
+                            arreglo="--network network=%s-red" % uvus, seccion=sec))
+    elif "network=%s-red" % uvus not in red:
+        graves.append(aviso("La orden conecta la máquina a otra red: %s" % red, fallo="C1",
+                            efecto="la IP de network-config es de su red: en otra no "
+                                   "podrá llegar a la máquina.",
+                            arreglo="--network network=%s-red" % uvus, seccion=sec))
+    disco = _ruta_de_disk(_valor(palabras, "--disk"))
+    if disco is None:
+        graves.append(error("La orden no lleva --disk path=...", fallo="C1",
+                            efecto="la máquina no tiene el disco con Ubuntu.",
+                            arreglo="--disk path=%s.qcow2" % maquina, seccion=sec))
+    elif os.path.basename(disco) != "%s.qcow2" % maquina:
+        menores.append(aviso("La orden usa el disco %s, no %s.qcow2" % (disco, maquina),
+                             efecto="si ese disco ya lo usó otra máquina, cloud-init no se "
+                                    "vuelve a aplicar (D2).",
+                             arreglo="--disk path=%s.qcow2, un disco nuevo para cada máquina."
+                                     % maquina, seccion=sec))
+    ram = _valor(palabras, "--ram") or _valor(palabras, "--memory")
+    if ram is not None and ram.replace("memory=", "") != "2048":
+        menores.append(aviso("La orden pide %s MiB de RAM; el manual, 2048" % ram,
+                             arreglo="--ram=2048.", seccion=sec))
+    vcpus = _valor(palabras, "--vcpus")
+    if vcpus is not None and vcpus != "2":
+        menores.append(aviso("La orden pide %s vCPU; el manual, 2" % vcpus,
+                             arreglo="--vcpus=2", seccion=sec))
+    if "--noautoconsole" not in palabras and "-noautoconsole" not in palabras:
+        menores.append(aviso("La orden no lleva --noautoconsole",
+                             arreglo="añada --noautoconsole (con dos guiones).", seccion=sec))
+
+    if graves:
+        # El primero lleva los pasos completos; los demás, solo su corrección
+        primero = graves[0]
+        corregir = "Corrija la orden: %s" % "; ".join(
+            texto_del_arreglo(g.arreglo).rstrip(".") for g in graves) + "."
+        if existe:
+            primero.arreglo = pasos_rehacer(corregir, uvus, maquina)
+        else:
+            primero.arreglo = [corregir, "La orden del manual, con sus nombres (desde "
+                               "~/imagenesMV, en una sola línea):", "$ " + manual]
+        for g in graves[1:]:
+            g.arreglo = "%s (los pasos completos, arriba)." % texto_del_arreglo(
+                g.arreglo).rstrip(".")
+    rs += graves + menores
+    if len(rs) == 1:
         rs.append(ok("La orden de virt-install es como la del manual"))
     return rs
 
@@ -2077,12 +2533,16 @@ def comprobar_intento_anterior(home, uvus, nombre):
         return []
     if intento.completado and not intento.errores:
         return [ok("Ya la creó el %s y después la eliminó" % intento.fecha)]
-    rs = comprobar_orden(home, uvus, nombre, intento)
+    rs = comprobar_orden(home, uvus, nombre, intento, existe=False)
     if not intento.errores and not [r for r in rs if r.estado in (ERROR, AVISO)]:
         rs.append(aviso("El último virt-install de %s (%s) no llegó a crear la máquina"
                         % (nombre, intento.fecha),
                         efecto="su registro no dice por qué; revise lo que mostró en "
-                               "pantalla.", seccion="instanciar"))
+                               "pantalla.",
+                        arreglo=["Corrija lo que señale esta revisión y vuelva a ejecutar "
+                                 "la orden del manual (desde ~/imagenesMV, en una sola "
+                                 "línea):", "$ " + orden_virt_install()],
+                        seccion="instanciar"))
     return rs
 
 
@@ -2147,6 +2607,11 @@ def leer_disco(disco):
         if "lock" in err:
             return {}, None, error("El disco está en uso (¿la máquina sigue encendida?)",
                                    detalle=["guestfish dice: %s" % ultima[0]],
+                                   arreglo=["Compruebe que la máquina está apagada y "
+                                            "repita:",
+                                            "$ virsh domstate %s" % nombre_de_maquina(),
+                                            "Si no dice «shut off», apáguela: virsh "
+                                            "shutdown %s" % nombre_de_maquina()],
                                    seccion="acceso")
         return {}, None, error("No se ha podido leer el disco",
                                detalle=["guestfish dice: %s" % ultima[0]],
@@ -2189,6 +2654,12 @@ def _con_prefijo(resultados, prefijo):
         if len(texto) > 1 and texto[0].isupper() and texto[1].islower():
             texto = texto[0].lower() + texto[1:]
         r.texto = prefijo + texto
+        # La máquina ya está creada: corregir el archivo no basta
+        if r.arreglo:
+            r.arreglo = pasos_rehacer("Corrija el archivo del silo: %s" % texto_del_arreglo(
+                r.arreglo).replace("\n", " "))
+        elif r.estado == ERROR:
+            r.arreglo = pasos_rehacer()
     return resultados
 
 
@@ -2209,13 +2680,16 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
         rs.append(error("cloud-init no llegó a configurar la máquina", fallo="C1",
                         detalle=["No hay ninguna instancia en %s." % DIR_INSTANCIAS],
                         efecto="la máquina no tiene ni el usuario ni la IP del manual.",
-                        arreglo="compruebe que pasó los tres archivos a virt-install.",
+                        arreglo=pasos_rehacer("Compruebe en el bloque 4 que la orden de "
+                                              "virt-install lleva --cloud-init con los "
+                                              "tres archivos."),
                         seccion=sec))
     elif len(instancias) > 1:
         rs.append(aviso("El disco se ha configurado con %d instance-id distintos" % len(instancias),
                         fallo="D2", detalle=["Instancias: %s." % ", ".join(instancias)],
-                        efecto="el disco se reutilizó con otro meta-data.",
-                        arreglo="para una máquina nueva, use siempre un disco nuevo.",
+                        efecto="el disco se reutilizó con otro meta-data: la máquina "
+                               "mezcla la configuración de varias.",
+                        arreglo=pasos_rehacer(),
                         seccion=sec))
     else:
         rs.append(ok("cloud-init configuró la máquina con el instance-id %s" % instancias[0]))
@@ -2226,7 +2700,8 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
     if estado is not None and not fuente:
         rs.append(error("cloud-init no encontró los archivos de configuración", fallo="C1",
                         efecto="la máquina arrancó sin user-data, meta-data ni network-config.",
-                        arreglo="compruebe la opción --cloud-init de virt-install.",
+                        arreglo=pasos_rehacer("Compruebe en el bloque 4 la opción "
+                                              "--cloud-init de virt-install."),
                         seccion=sec))
 
     resultado = _json(archivos.get("/var/lib/cloud/data/result.json"))
@@ -2236,11 +2711,23 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
         if errores:
             rs.append(error("cloud-init terminó con errores", fallo="B4",
                             detalle=["cloud-init: %s" % str(e)[:200] for e in errores[:4]],
+                            efecto="la parte de user-data o network-config que falló no "
+                                   "se aplicó a la máquina.",
+                            arreglo=pasos_rehacer(
+                                "Los mensajes de arriba dicen qué falló; corríjalo en "
+                                "user-data o network-config (los bloques 5 le ayudan). "
+                                "cloud-init solo se aplica en el primer arranque, por eso "
+                                "hay que volver a crearla."),
                             seccion=sec))
         avisos = [(nivel, m) for nivel, ms in recuperables.items() for m in ms]
         if avisos:
             rs.append(aviso("cloud-init dejó avisos", fallo="B4",
                             detalle=["%s: %s" % (n, str(m)[:200]) for n, m in avisos[:4]],
+                            efecto="suelen venir de una clave de user-data mal escrita u "
+                                   "obsoleta: esa parte puede no haberse aplicado.",
+                            arreglo="si la máquina funciona, no hace falta rehacerla. Si no, "
+                                    "corrija en user-data lo que dicen los avisos y vuelva a "
+                                    "crearla con un disco nuevo.",
                             seccion=sec))
         if not errores and not avisos:
             rs.append(ok("cloud-init terminó sin errores ni avisos"))
@@ -2255,8 +2742,7 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
                 fallo="D2" if mismo_iid else None,
                 efecto="cloud-init solo se aplica en el primer arranque: corregir "
                        "user-data después no cambia la máquina." if mismo_iid else None,
-                arreglo="elimine la máquina y su disco, y créela de nuevo desde el "
-                        "primer paso de la 5.4.2." if mismo_iid else None,
+                arreglo=pasos_rehacer() if mismo_iid else None,
                 seccion=sec))
         problemas_ud = [r for r in comprobar_user_data(aplicado, clave)
                         if r.estado in (ERROR, AVISO)]
@@ -2269,8 +2755,10 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
         if texto is None:
             rs.append(error("En la máquina, administrador no tiene authorized_keys",
                             fallo="B5", efecto="«Permission denied (publickey)».",
-                            arreglo="revise ssh_authorized_keys en user-data (o si se creó "
-                                    "el usuario administrador).", seccion=sec))
+                            arreglo=pasos_rehacer(
+                                "Revise en user-data (bloque 5) que crea el usuario "
+                                "administrador y que lleva ssh_authorized_keys con su "
+                                "clave."), seccion=sec))
         else:
             instaladas = [c for c in (analizar_clave_publica(l) for l in texto.splitlines()
                                       if l.strip() and not l.startswith("#")) if c]
@@ -2292,8 +2780,7 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
                     efecto="el disco ya se configuró una vez con este instance-id: corregir "
                            "user-data y crear la máquina con el mismo disco no cambia nada. "
                            "ssh seguirá respondiendo «Permission denied (publickey)».",
-                    arreglo="elimine la máquina y su disco, y créela de nuevo desde el "
-                            "primer paso de la 5.4.2, con un disco nuevo.",
+                    arreglo=pasos_rehacer(),
                     seccion=sec))
             else:
                 rs.append(error(
@@ -2301,8 +2788,10 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
                     detalle=["En la máquina: %s" % c.describir() for c in instaladas]
                     + ["id_rsa.pub:    %s" % clave.describir()],
                     efecto="«Permission denied (publickey)».",
-                    arreglo="si regeneró la clave después de crear la máquina, vea la "
-                            "FAQ B.3; si no, corrija user-data y cree la máquina de nuevo.",
+                    arreglo=pasos_rehacer(
+                        "Si regeneró la clave después de crear la máquina, esta solo "
+                        "acepta la anterior (FAQ B.3). Ponga en user-data la de ahora "
+                        "(cat ~/.ssh/id_rsa.pub)."),
                     seccion="faq-publickey"))
 
     # La red que quedó en la máquina
@@ -2322,6 +2811,9 @@ def comprobar_disco(archivos, instancias, clave, user_data_actual, iid_actual, r
     elif "/etc/netplan/50-cloud-init.yaml" in archivos and netplan is None:
         rs.append(error("La máquina no tiene la configuración de red de cloud-init",
                         fallo="B6", efecto="no tiene la IP fija de network-config.",
+                        arreglo=pasos_rehacer(
+                            "Revise network-config (bloque 5) y que la orden de "
+                            "virt-install lo lleva en --cloud-init (bloque 4)."),
                         seccion=sec))
     return rs
 
@@ -2338,7 +2830,9 @@ sección 5.4) y dice qué falla. Ejecútelo desde su silo (~/imagenesMV).
               Si no la indica, se toma del local-hostname de meta-data.
   --antes     revisión antes de virt-install (silo, red, imagen, archivos,
               claves).
-  --acceso    revisión de una máquina ya creada en la que no puede entrar.
+  --acceso    revisión de una máquina ya creada, en cinco bloques: la
+              máquina y su red, su disco, las claves SSH y el acceso, la
+              orden de virt-install y los archivos de cloud-init.
   --ip IP     la IP de la máquina, si no es la de su network-config.
   --version   muestra la versión.
   --ayuda     muestra esta ayuda.
@@ -2432,6 +2926,8 @@ def diagnosticar_antes(uvus, home, directorio, maquina, conn=None):
     los tests de esas partes. Devuelve (informe, máquina, existe la máquina).
     """
     informe = Informe()
+    CONTEXTO.clear()
+    CONTEXTO.update(uvus=uvus, maquina=maquina)
     res_claves, clave = comprobar_claves(home)
     red, existe = None, False
     if conn is not None:
@@ -2441,6 +2937,7 @@ def diagnosticar_antes(uvus, home, directorio, maquina, conn=None):
         res_red, red = comprobar_red(conn, uvus)
         informe.bloque("Red", res_red)
     res_archivos, maquina, ip = diagnosticar_archivos(uvus, directorio, maquina, clave, red)
+    CONTEXTO.update(maquina=maquina, ip=ip)
     if conn is not None:
         informe.bloque("Imagen y disco", comprobar_imagen_y_disco(directorio, maquina))
     informe.bloque("Archivos de cloud-init", res_archivos)
@@ -2497,9 +2994,13 @@ def _ip_de_network_config(directorio):
 
 
 def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
-    """Revisión de una máquina ya creada en la que no se puede entrar."""
+    """Revisión de una máquina ya creada, en cinco bloques: 1, la máquina y su red;
+    2, su disco; 3, las claves SSH y el acceso; 4, la orden de virt-install con la
+    que se creó, y 5, los archivos de cloud-init del silo."""
     informe = Informe()
     nombre = "%s-%s" % (uvus, maquina)
+    CONTEXTO.clear()
+    CONTEXTO.update(uvus=uvus, maquina=maquina)
     dominio = buscar_dominio(conn, nombre)
     if dominio is None:
         informe.bloque("Máquina", [error(
@@ -2508,12 +3009,8 @@ def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
                     "./ci-diagnosis --antes.", seccion="instanciar")])
         return informe
     m = Maquina(dominio)
-    informe.bloque("Máquina", comprobar_maquina(m, uvus))
     res_claves, clave = comprobar_claves(home)
     res_red, red = comprobar_red(conn, uvus)
-    problemas_red = [r for r in res_red if r.estado in (ERROR, AVISO)]
-    if problemas_red:
-        informe.bloque("Red", problemas_red)
 
     # La IP: la indicada, la de network-config si es de esta máquina, o la de ARP
     _, iid = _meta_del_silo(directorio)
@@ -2522,8 +3019,11 @@ def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
         ip, origen = _ip_de_network_config(directorio), "network-config"
     if ip is None and m.encendida:
         ip, origen = ip_por_arp(dominio), "las tablas ARP del servidor"
+    CONTEXTO["ip"] = ip
 
-    entra = False
+    # 1. La máquina y su red
+    maquina_y_red = comprobar_maquina(m, uvus) + res_red
+    acceso, entra = [], False
     if m.encendida:
         if ip is None:
             if iid == nombre:
@@ -2532,64 +3032,84 @@ def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
                 motivo = "el meta-data del silo es de otra máquina (%s)" % iid
             else:
                 motivo = "no hay meta-data en este directorio"
-            informe.bloque("Conectividad", [omitida(
-                "No se sabe la IP de la máquina: %s. Indíquela con --ip" % motivo)])
+            maquina_y_red.append(omitida(
+                "No se sabe la IP de la máquina: %s. Indíquela con --ip" % motivo))
+            acceso.append(omitida("Acceso por SSH: no se sabe la IP de la máquina"))
         else:
             res_con, abierto = comprobar_conectividad(ip)
-            informe.bloque("Conectividad", [ok("IP %s (de %s)" % (ip, origen))] + res_con)
+            maquina_y_red += [ok("IP %s (de %s)" % (ip, origen))] + res_con
             if abierto:
                 cifrada, en_agente = estado_de_la_clave(home)
-                res_ssh, entra = comprobar_ssh(ip, home, cifrada, en_agente, maquina)
-                informe.bloque("Acceso por SSH", res_ssh)
-        if not entra:
-            informe.bloque("Disco de la máquina", [omitida(
-                "Para revisar su disco, apáguela (virsh shutdown %s), espere a que "
-                "virsh domstate %s diga «shut off» y vuelva a ejecutar ./ci-diagnosis"
-                % (nombre, nombre))])
-    elif m.apagada:
-        informe.bloque("Conectividad", [omitida("Conectividad y SSH: la máquina está apagada")])
-        informe.bloque("Disco de la máquina", revisar_disco(conn, m, clave, directorio,
-                                                            iid, red))
-    if not entra:
-        informe.bloque("Orden de virt-install", comprobar_orden(home, uvus, nombre))
-        res_archivos, _, _ = diagnosticar_archivos(uvus, directorio, maquina, clave, red)
-        informe.bloque("Archivos de cloud-init (en el silo)", res_archivos)
-    informe.bloque("Claves SSH", res_claves)
+                acceso, entra = comprobar_ssh(ip, home, cifrada, en_agente, maquina)
+            else:
+                acceso.append(omitida("Acceso por SSH: el puerto 22 no responde "
+                                      "(bloque 1)"))
+    else:
+        estado = "apagada" if m.apagada else NOMBRES_ESTADO.get(m.estado, str(m.estado))
+        maquina_y_red.append(omitida("Conectividad: la máquina está %s" % estado))
+        acceso.append(omitida("Acceso por SSH: la máquina está %s" % estado))
+    informe.bloque("1. Máquina y red", maquina_y_red)
+
+    # 2. Su disco: por fuera siempre; por dentro, solo apagada
+    informe.bloque("2. Disco", revisar_disco(conn, m, clave, directorio, iid, red, entra))
+
+    # 3, 4 y 5
+    informe.bloque("3. Claves SSH y acceso", res_claves + acceso)
+    informe.bloque("4. Orden de virt-install", comprobar_orden(home, uvus, nombre))
+    res_archivos, _, _ = diagnosticar_archivos(uvus, directorio, maquina, clave, red)
+    informe.bloque("5. Archivos de cloud-init (en el silo)", res_archivos)
+    compactar_rehacer(informe.todos())
     return informe
 
 
-def revisar_disco(conn, maquina, clave, directorio, iid, red):
+def revisar_disco(conn, maquina, clave, directorio, iid, red, entra=False):
     if not maquina.discos:
-        return [error("La máquina no tiene ningún disco", seccion="instanciar")]
+        return [error("La máquina no tiene ningún disco", fallo="C1",
+                      efecto="no puede arrancar.", arreglo=pasos_rehacer(),
+                      seccion="instanciar")]
     disco = maquina.discos[0]
+    rs = [ok("Disco de la máquina: %s" % disco)]
+    if not os.path.exists(disco):
+        return rs + [error("No existe el disco de la máquina", fallo="B3",
+                           efecto="la máquina no puede arrancar.",
+                           arreglo=pasos_rehacer(), seccion="instanciar")]
+    por_fuera, falta_respaldo = comprobar_disco_cow(disco, None,
+                                                    existe_maquina=True)
+    rs += por_fuera
+    if maquina.encendida:
+        if entra:
+            rs.append(omitida("Por dentro: no hace falta revisarlo, puede entrar en la "
+                              "máquina"))
+        else:
+            rs.append(omitida(
+                "Por dentro: para revisarlo, apáguela (virsh shutdown %s), espere a que "
+                "virsh domstate %s diga «shut off» y vuelva a ejecutar ./ci-diagnosis"
+                % (maquina.nombre, maquina.nombre)))
+        return rs
+    if not maquina.apagada:
+        rs.append(omitida("Por dentro: la máquina tiene que estar apagada (virsh "
+                          "shutdown %s)" % maquina.nombre))
+        return rs
+    if falta_respaldo:
+        return rs
     for d in conn.listAllDomains(0):
         if d.name() != maquina.nombre and d.isActive() and disco in discos_de(d):
-            return [error("El disco lo está usando la máquina encendida %s" % d.name(),
-                          fallo="C2", seccion="instanciar")]
-    info, _ = info_imagen(disco)
-    respaldo = (info or {}).get("backing-filename")
-    if respaldo:
-        completo = info.get("full-backing-filename") or os.path.join(
-            os.path.dirname(disco), respaldo)
-        if not os.path.exists(completo):
-            # Visto en avantasia (6-nov): virsh start dice «Cannot access backing
-            # file ... No such file or directory», y guestfish no puede leer el disco
-            return [error("No está la imagen de la que depende el disco de la máquina",
-                          fallo="B3", detalle=["Disco: %s" % disco, "Respaldo: %s" % completo],
-                          efecto="la máquina no puede arrancar («Cannot access backing file "
-                                 "... No such file or directory») y su disco no se puede leer.",
-                          arreglo="devuelva la imagen base a ese sitio, con ese nombre: la "
-                                  "imagen base no se puede mover ni renombrar.",
-                          seccion="instanciar")]
+            return rs + [error(
+                "El disco lo está usando la máquina encendida %s" % d.name(),
+                fallo="C2", efecto="las dos máquinas acabarían estropeando el disco.",
+                arreglo="cada máquina necesita su propio disco. Apague %s (virsh shutdown "
+                        "%s) y no la arranque a la vez que esta." % (d.name(), d.name()),
+                seccion="instanciar")]
     previo = comprobar_libguestfs()
     if previo is not None and previo.estado == ERROR:
-        return [previo]
+        return rs + [previo]
     archivos, instancias, problema = leer_disco(disco)
     if problema is not None:
-        return [problema]
+        return rs + [problema]
     actual = leer_bytes(os.path.join(directorio, "user-data"))
     actual = actual.decode("utf-8", "replace") if actual is not None else None
-    rs = [ok("Disco leído: %s" % disco)] + ([previo] if previo else [])
+    rs += [ok("Por dentro: disco leído (con la máquina apagada)")] + ([previo] if previo
+                                                                     else [])
     return rs + comprobar_disco(archivos, instancias, clave, actual, iid, red)
 
 
@@ -2653,7 +3173,7 @@ def main(argv=None):
     print("ci-diagnosis %s · %s · usuario: %s · máquina: %s" % (
         VERSION, servidor, uvus, "%s-%s" % (uvus, maquina) if maquina else "sin determinar"))
     if modo == "acceso":
-        print("Modo: no puede entrar en la máquina (--acceso)")
+        print("Modo: revisión de la máquina ya creada (--acceso)")
         if opciones["modo"] is None:
             print("(La máquina ya existe. Para revisarla como antes de crearla: --antes)")
     else:

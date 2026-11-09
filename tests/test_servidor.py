@@ -218,7 +218,7 @@ class TestImagenYDisco(ConHome):
         self.disco()
         os.rename(os.path.join(self.silo, cd.IMAGEN_BASE), os.path.join(self.silo, "otra.img"))
         textos = [r.texto for r in con_estado(self.revisar(), cd.ERROR)]
-        self.assertIn("No está la imagen de la que depende server1.qcow2", textos)
+        self.assertIn("No está la imagen de la que depende el disco server1.qcow2", textos)
 
     def test_imagen_escribible_por_el_grupo(self):
         self.base()

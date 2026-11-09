@@ -31,7 +31,7 @@ try:
 except ImportError:  # sin PyYAML se omiten las comprobaciones de estructura
     yaml = None
 
-VERSION = "1.0.2"
+VERSION = "1.1.0-dev"
 
 # Si José Antonio decide que la herramienta solo señale los fallos, basta con
 # poner esto a False: «Cómo arreglarlo» desaparece de toda la salida.
@@ -49,9 +49,12 @@ class Resultado:
     estado   OK, AVISO, ERROR u OMITIDA (no comprobada: falla algo de lo que depende)
     texto    una línea con lo comprobado o lo que falla
     fallo    código del catálogo (B5, D6...), si lo hay
-    detalle  líneas con datos concretos (números de línea, huellas...)
+    detalle  líneas con datos concretos (números de línea, huellas...). En los OK
+             también se muestran (por ejemplo, la orden de virt-install)
     efecto   qué pasará si no se arregla
-    arreglo  cómo arreglarlo
+    arreglo  cómo arreglarlo: un texto, o una lista de pasos. En la lista, los
+             pasos que empiezan por «$ » son órdenes: se muestran tal cual, en
+             una sola línea, para que se puedan copiar
     seccion  clave de SECCIONES (textos.py)
     """
 
@@ -118,6 +121,28 @@ def _envolver(texto, primera, resto):
                          break_long_words=False) or [primera.rstrip()]
 
 
+def texto_del_arreglo(arreglo):
+    """El arreglo como un solo texto (para buscar en él)."""
+    if arreglo is None or isinstance(arreglo, str):
+        return arreglo or ""
+    return "\n".join(p[2:] if p.startswith("$ ") else p for p in arreglo)
+
+
+def _lineas_del_arreglo(arreglo):
+    if isinstance(arreglo, str):
+        return _envolver("Cómo arreglarlo: " + arreglo, SANGRIA, SANGRIA)
+    lineas = [SANGRIA + "Cómo arreglarlo:"]
+    for paso in arreglo:
+        if paso.startswith("$ "):
+            # Una orden: nunca se parte, para que se pueda copiar entera
+            lineas.append(SANGRIA + "     " + paso[2:])
+        else:
+            # Los pasos numerados («1. ...») siguen alineados tras el número
+            resto = "     " if re.match(r"^\d\. ", paso) else "  "
+            lineas += _envolver(paso, SANGRIA + "  ", SANGRIA + resto)
+    return lineas
+
+
 def formatear_resultado(r, color=False):
     etiqueta = r.estado.ljust(7)
     if color:
@@ -125,14 +150,14 @@ def formatear_resultado(r, color=False):
     texto = r.texto + (" [%s]" % r.fallo if r.fallo else "")
     lineas = _envolver(texto, "  " + "X" * 7, SANGRIA)
     lineas[0] = "  " + etiqueta + lineas[0][9:]
-    if r.estado in (OK, OMITIDA):
-        return lineas
     for d in r.detalle:
         lineas += _envolver(d, SANGRIA, SANGRIA + "  ")
+    if r.estado in (OK, OMITIDA):
+        return lineas
     if r.efecto:
         lineas += _envolver("Efecto: " + r.efecto, SANGRIA, SANGRIA)
     if r.arreglo and MOSTRAR_ARREGLO:
-        lineas += _envolver("Cómo arreglarlo: " + r.arreglo, SANGRIA, SANGRIA)
+        lineas += _lineas_del_arreglo(r.arreglo)
     if r.seccion:
         lineas += _envolver("Manual: " + SECCIONES[r.seccion], SANGRIA, SANGRIA)
     return lineas
