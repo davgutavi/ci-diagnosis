@@ -3,8 +3,6 @@
 ### Diagnóstico de máquinas virtuales construidas con cloud-init
 **Asignatura: Sistemas Operativos — Universidad de Sevilla**
 
-> Todavía no está instalada en los servidores de la asignatura.
-
 `ci-diagnosis` revisa, en el servidor de la asignatura, la construcción de una
 máquina virtual con cloud-init siguiendo el manual (sección 5.4) y le dice qué
 falla, por qué, cómo arreglarlo y en qué sección del manual se explica.
@@ -13,13 +11,28 @@ falla, por qué, cómo arreglarlo y en qué sección del manual se explica.
 silos ni redes y no muestra nunca su clave privada. Se ejecuta con su cuenta,
 sin `sudo`.
 
+## Cómo se descarga
+
+En el servidor, descárguela en su silo y dele permiso de ejecución:
+
+```
+cd ~/imagenesMV
+wget https://raw.githubusercontent.com/davgutavi/ci-diagnosis/main/ci-diagnosis -O ci-diagnosis && chmod u+x ci-diagnosis
+```
+
+Con `curl`: `curl -L https://raw.githubusercontent.com/davgutavi/ci-diagnosis/main/ci-diagnosis -o ci-diagnosis && chmod u+x ci-diagnosis`.
+
+Para tener la última versión, repita la descarga: con `-O ci-diagnosis`, `wget`
+sobrescribe la que tenía (sin `-O`, guardaría la nueva como `ci-diagnosis.1`).
+Para ver qué versión tiene: `./ci-diagnosis --version`.
+
 ## Cómo se usa
 
 Ejecútela en el servidor, desde su silo:
 
 ```
 cd ~/imagenesMV
-ci-diagnosis server1
+./ci-diagnosis server1
 ```
 
 Sustituya `server1` por la máquina que quiere revisar (también vale `1` o
@@ -48,8 +61,8 @@ disco. Ella nunca la apaga.
 Otras opciones:
 
 ```
-ci-diagnosis server1 --ip 192.168.XXX.YYY   # si la IP no es la de su network-config
-ci-diagnosis --ayuda
+./ci-diagnosis server1 --ip 192.168.XXX.YYY   # si la IP no es la de su network-config
+./ci-diagnosis --ayuda
 ```
 
 ## Lo que no revisa
