@@ -120,6 +120,9 @@ def diagnosticar_antes(uvus, home, directorio, maquina, conn=None):
     if conn is not None:
         res_nombres, existe = comprobar_nombres_libres(conn, uvus, home, directorio,
                                                        maquina, ip, red)
+        if not res_nombres and maquina is None:
+            res_nombres = [omitida("Nombre de la máquina: no se sabe qué máquina es "
+                                   "(indíquela: ./ci-diagnosis server1)")]
         informe.bloque("Nombres libres", res_nombres)
         if maquina and not existe:
             anterior = comprobar_intento_anterior(home, uvus, "%s-%s" % (uvus, maquina))
