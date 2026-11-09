@@ -476,14 +476,23 @@ def comprobar_orden(home, uvus, nombre, intento=None, existe=True):
                 arreglo="--cloud-init user-data=user-data,meta-data=meta-data,"
                         "network-config=network-config", seccion=sec))
         else:
+            # Los del silo: con ese nombre, sin directorio o con el del silo
+            # (visto en avantasia, 9-nov: --cloud-init user-data=/tmp/.../user-data)
+            silo = CONTEXTO.get("directorio")
             otros = []
             for parte in ci.split(","):
                 clave, _, valor = parte.partition("=")
-                if clave in ARCHIVOS_CI and os.path.basename(valor) != clave:
+                if clave not in ARCHIVOS_CI:
+                    continue
+                directorio = os.path.dirname(valor)
+                del_silo = os.path.basename(valor) == clave and (
+                    directorio in ("", ".") or silo is None
+                    or os.path.realpath(directorio) == os.path.realpath(silo))
+                if not del_silo:
                     otros.append("%s=%s" % (clave, valor))
             if otros:
                 menores.append(aviso(
-                         "--cloud-init no usa los archivos %s" % ", ".join(ARCHIVOS_CI),
+                         "--cloud-init no usa los archivos %s del silo" % ", ".join(ARCHIVOS_CI),
                          detalle=["Usa: %s" % ", ".join(otros)],
                          efecto="la máquina se creó con esos archivos, y el bloque 5 revisa "
                                 "los de nombre exacto: puede que no sean los mismos.",

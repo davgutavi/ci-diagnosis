@@ -180,7 +180,7 @@ def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
     informe = Informe()
     nombre = "%s-%s" % (uvus, maquina)
     CONTEXTO.clear()
-    CONTEXTO.update(uvus=uvus, maquina=maquina)
+    CONTEXTO.update(uvus=uvus, maquina=maquina, directorio=directorio)
     dominio = buscar_dominio(conn, nombre)
     if dominio is None:
         informe.bloque("Máquina", [error(
