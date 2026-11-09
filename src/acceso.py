@@ -281,7 +281,7 @@ def comprobar_ssh(ip, home, cifrada, en_agente, esperado=None):
     elif "Permission denied" in err:
         if cifrada and not en_agente:
             rs.append(omitida(
-                "Acceso por ssh: no concluyente. Su clave tiene frase de paso y no está "
+                "Acceso por ssh: no concluyente. Su clave tiene contraseña y no está "
                 "en el agente, así que esta prueba no puede usarla (D6). Cárguela con "
                 "ssh-add y repita, o pruebe ssh %s@%s a mano" % (USUARIO_VM, ip)))
         else:

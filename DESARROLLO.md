@@ -108,7 +108,7 @@ tienen que probarse como los verá un alumno.
   libvirt, donde no hay alumnos. Descarga la imagen de 22.04 la primera vez.
 - **Fase e:** B9 (silo sobre un directorio que no existía), B3 con máquina
   (disco menor que la base, base movida), D5 (dos máquinas encendidas con la
-  misma IP) y D6 (frase de paso tecleada mal). Unos 10 minutos.
+  misma IP) y D6 (contraseña de la clave tecleada mal). Unos 10 minutos.
 
 El registro completo queda en `/tmp/pruebas-ci-diagnosis-<usuario>-<fecha>.log`.
 
@@ -140,8 +140,8 @@ la cuenta de prueba está activo y haría fallar `virt-install` a todos (A1).
   (`PreferredAuthentications=publickey`, `PasswordAuthentication=no`, …): un ssh
   que no puede preguntar acaba enviando contraseñas vacías, y cada una cuenta
   como «Failed password» para fail2ban (catálogo, A4 y E4).
-- **ssh, sin falsos negativos.** `BatchMode=yes` no puede pedir la frase de
-  paso: si la clave la tiene y no está en el agente, el resultado es «no
+- **ssh, sin falsos negativos.** `BatchMode=yes` no puede pedir la contraseña
+  de la clave: si la clave la tiene y no está en el agente, el resultado es «no
   concluyente», no un error. Y nunca escribe en `known_hosts`: con una entrada
   para la IP se prueba en modo estricto (D4); sin ella, con `/dev/null`.
 - **Silos por trayecto.** Los nombres de los silos no identifican al dueño

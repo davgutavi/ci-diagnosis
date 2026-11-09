@@ -62,8 +62,8 @@ def escribir(ruta, contenido, modo=None):
 
 
 class Claves:
-    """Tres parejas de claves para todos los tests: la del servidor sin frase,
-    la del servidor con frase y la «del portátil»."""
+    """Tres parejas de claves para todos los tests: la del servidor sin
+    contraseña, la del servidor con contraseña y la «del portátil»."""
 
     _dir = None
 
