@@ -111,6 +111,31 @@ profesor tal cual.
 El código de salida es 0 si no hay ningún ERROR, 1 si hay alguno y 2 si la
 herramienta no ha podido hacer la revisión.
 
+## Para el profesorado: revisar la cuenta de un alumno
+
+`tools/ci-diagnosis-admin` lanza la misma revisión sobre la cuenta de un alumno,
+como si la ejecutara él. Necesita `sudo`, así que solo sirve al profesorado.
+
+Una vez, en el servidor, en `~/bin` (Ubuntu lo añade al `PATH` al iniciar
+sesión, si existe):
+
+```
+mkdir -p ~/bin && wget -q https://raw.githubusercontent.com/davgutavi/ci-diagnosis/main/tools/ci-diagnosis-admin -O ~/bin/ci-diagnosis-admin && chmod 755 ~/bin/ci-diagnosis-admin && ~/bin/ci-diagnosis-admin --actualizar
+```
+
+Después, para revisar a un alumno:
+
+```
+ci-diagnosis-admin UVUS            # la máquina de su meta-data
+ci-diagnosis-admin UVUS server2    # otra máquina
+```
+
+Muestra sus silos y sus máquinas, elige el directorio en el que trabaja (su silo
+`UVUS-imagenesMV`, o `~/imagenesMV`; `--dir` para indicar otro) y ejecuta
+`ci-diagnosis` como el alumno con `sudo`, que pide su contraseña. Solo lee:
+no cambia nada en su cuenta. `ci-diagnosis-admin --actualizar` descarga la
+última versión de los dos programas.
+
 ## Para quien la desarrolle
 
 Lea [DESARROLLO.md](DESARROLLO.md).
