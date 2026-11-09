@@ -327,7 +327,8 @@ def main(argv=None):
             print("(La máquina ya existe. Para revisarla como antes de crearla: --antes)")
     else:
         print("Modo: antes de virt-install (--antes)")
-    print("(Versión en desarrollo.)")
+    if "dev" in VERSION:
+        print("(Versión en desarrollo.)")
     print()
     for linea in formatear_informe(informe, usar_color(sys.stdout)):
         print(linea)
