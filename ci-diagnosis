@@ -32,7 +32,7 @@ try:
 except ImportError:  # sin PyYAML se omiten las comprobaciones de estructura
     yaml = None
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # Si José Antonio decide que la herramienta solo señale los fallos, basta con
 # poner esto a False: «Cómo arreglarlo» desaparece de toda la salida.
@@ -2655,7 +2655,8 @@ def main(argv=None):
             print("(La máquina ya existe. Para revisarla como antes de crearla: --antes)")
     else:
         print("Modo: antes de virt-install (--antes)")
-    print("(Versión en desarrollo.)")
+    if "dev" in VERSION:
+        print("(Versión en desarrollo.)")
     print()
     for linea in formatear_informe(informe, usar_color(sys.stdout)):
         print(linea)
