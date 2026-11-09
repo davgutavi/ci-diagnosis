@@ -487,7 +487,7 @@ def comprobar_nombres_libres(conn, uvus, home, directorio, maquina, ip=None, red
                             arreglo="si quiere volver a crearla, apáguela y elimínela "
                                     "con su disco (virsh destroy y virsh undefine "
                                     "--remove-all-storage). Si lo que pasa es que no puede "
-                                    "entrar en ella, use ci-diagnosis --acceso.",
+                                    "entrar en ella, use ./ci-diagnosis --acceso.",
                             seccion="acceso"))
         else:
             rs.append(ok("El nombre %s está libre" % nombre))

@@ -1,7 +1,7 @@
 # --- Programa principal --------------------------------------------------------
 
 USO = """\
-Uso: ci-diagnosis [serverX] [--antes | --acceso] [--ip IP]
+Uso: ./ci-diagnosis [serverX] [--antes | --acceso] [--ip IP]
 
 Revisa la construcción de una máquina virtual con cloud-init (manual,
 sección 5.4) y dice qué falla. Ejecútelo desde su silo (~/imagenesMV).
@@ -174,7 +174,7 @@ def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
         informe.bloque("Máquina", [error(
             "No existe la máquina %s" % nombre,
             arreglo="si todavía no la ha creado, revise antes su trabajo con "
-                    "ci-diagnosis --antes.", seccion="instanciar")])
+                    "./ci-diagnosis --antes.", seccion="instanciar")])
         return informe
     m = Maquina(dominio)
     informe.bloque("Máquina", comprobar_maquina(m, uvus))
@@ -213,7 +213,7 @@ def diagnosticar_acceso(uvus, home, directorio, maquina, conn, ip_forzada=None):
         if not entra:
             informe.bloque("Disco de la máquina", [omitida(
                 "Para revisar su disco, apáguela (virsh shutdown %s), espere a que "
-                "virsh domstate %s diga «shut off» y vuelva a ejecutar ci-diagnosis"
+                "virsh domstate %s diga «shut off» y vuelva a ejecutar ./ci-diagnosis"
                 % (nombre, nombre))])
     elif m.apagada:
         informe.bloque("Conectividad", [omitida("Conectividad y SSH: la máquina está apagada")])
@@ -273,7 +273,7 @@ def main(argv=None):
         opciones = analizar_argumentos(argv)
     except ErrorDeUso as e:
         print("ci-diagnosis: %s" % e, file=sys.stderr)
-        print("Consulte la ayuda con: ci-diagnosis --ayuda", file=sys.stderr)
+        print("Consulte la ayuda con: ./ci-diagnosis --ayuda", file=sys.stderr)
         return 2
     if opciones["ayuda"]:
         print(USO, end="")
@@ -306,7 +306,7 @@ def main(argv=None):
         if modo == "acceso":
             if maquina is None:
                 print("ci-diagnosis: indique qué máquina quiere revisar "
-                      "(por ejemplo: ci-diagnosis server1 --acceso).", file=sys.stderr)
+                      "(por ejemplo: ./ci-diagnosis server1 --acceso).", file=sys.stderr)
                 return 2
             informe = diagnosticar_acceso(uvus, home, directorio, maquina, conn,
                                           opciones["ip"])
