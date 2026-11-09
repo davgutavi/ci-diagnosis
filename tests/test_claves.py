@@ -72,7 +72,7 @@ class TestComprobarClaves(unittest.TestCase):
         self.instalar("sin_frase")
         rs, clave = cd.comprobar_claves(self.home)
         self.assertEqual(problemas(rs), [])
-        self.assertIn("no tiene frase de paso", texto_de(rs))
+        self.assertIn("no tiene contraseña", texto_de(rs))
         self.assertEqual(clave.comentario, "alu0000@avantasia")
 
     def test_no_son_pareja(self):
@@ -81,7 +81,7 @@ class TestComprobarClaves(unittest.TestCase):
         self.assertEqual([(r.estado, r.fallo) for r in problemas(rs)], [(cd.ERROR, "B7")])
 
     def test_no_son_pareja_aunque_tenga_frase(self):
-        # La cabecera openssh-key-v1 da la pública sin pedir la frase
+        # La cabecera openssh-key-v1 da la pública sin pedir la contraseña
         self.instalar("con_frase", pub="sin_frase")
         rs, _ = cd.comprobar_claves(self.home)
         self.assertIn("B7", [r.fallo for r in con_estado(rs, cd.ERROR)])
