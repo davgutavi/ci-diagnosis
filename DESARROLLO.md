@@ -22,6 +22,15 @@ src/disco.py      --acceso con la máquina apagada: su disco, con guestfish --ro
 src/main.py       Opciones y flujo principal
 ```
 
+`tools/ci-diagnosis-admin` es aparte, no se genera: un script para el
+profesorado que busca los silos y las máquinas de un alumno (libvirt en solo
+lectura), elige su directorio de trabajo y lanza `ci-diagnosis` como el alumno
+con `sudo -u UVUS`. El programa le llega por la entrada estándar
+(`python3 -`), así que el alumno no necesita poder leer el directorio del
+profesor; `ci-diagnosis` no usa esa entrada (sus órdenes externas van con
+`stdin=DEVNULL`). La herramienta del alumno sigue sin `sudo`. Sus tests están en
+`tests/test_admin.py`.
+
 Tras modificar cualquiera de ellos, regenera el programa:
 
 ```bash

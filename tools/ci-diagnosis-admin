@@ -1,0 +1,241 @@
+#!/usr/bin/python3
+"""ci-diagnosis-admin: ci-diagnosis sobre la cuenta de un alumno, para el profesor.
+
+Uso:
+  ci-diagnosis-admin UVUS [serverX] [--antes | --acceso] [--ip IP] [--dir DIRECTORIO]
+  ci-diagnosis-admin --actualizar
+  ci-diagnosis-admin --ayuda
+
+Busca en libvirt los silos y las máquinas del alumno, elige el directorio en el
+que trabaja (su silo <uvus>-imagenesMV, o ~/imagenesMV) y lanza ci-diagnosis
+COMO EL ALUMNO, con sudo: así revisa sus archivos, sus claves y su acceso por
+ssh exactamente como los vería él. sudo pide la contraseña del profesor.
+
+  serverX         la máquina que se revisa (server1, 1 o <uvus>-server1). Si no
+                  se indica, ci-diagnosis la toma del meta-data del alumno.
+  --antes, --acceso, --ip IP
+                  se pasan tal cual a ci-diagnosis.
+  --dir DIRECTORIO
+                  revisar desde ese directorio en lugar del que se elige solo.
+  --actualizar    descarga la última versión de ci-diagnosis y de este script
+                  (rama main de GitHub) en el directorio de este script.
+
+ci-diagnosis solo lee: no cambia nada en la cuenta del alumno. El programa se le
+pasa por la entrada estándar, así que el alumno no necesita poder leer este
+directorio. Este script tampoco cambia nada: libvirt se abre en solo lectura.
+"""
+
+import os
+import pwd
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.request
+import xml.etree.ElementTree as ET
+
+URI = "qemu:///system"
+AQUI = os.path.dirname(os.path.abspath(__file__))
+URL = "https://raw.githubusercontent.com/davgutavi/ci-diagnosis/main/"
+DESCARGAS = (("ci-diagnosis", "ci-diagnosis"),
+             ("tools/ci-diagnosis-admin", "ci-diagnosis-admin"))
+# Lo que hace el alumno, con sudo: entrar en el directorio y ejecutar el programa
+# que llega por la entrada estándar, con el resto de argumentos
+LANZADOR = 'cd -- "$1" || exit 2; shift; exec /usr/bin/python3 - "$@"'
+
+
+class ErrorDeUso(Exception):
+    pass
+
+
+def analizar_argumentos(argv):
+    """Devuelve (uvus, directorio o None, argumentos para ci-diagnosis) o la
+    acción: ("ayuda",) o ("actualizar",)."""
+    if not argv or argv[0] in ("--ayuda", "-h", "--help"):
+        return ("ayuda",)
+    if argv[0] == "--actualizar":
+        if len(argv) > 1:
+            raise ErrorDeUso("--actualizar no lleva más argumentos")
+        return ("actualizar",)
+    uvus, resto = argv[0], argv[1:]
+    if uvus.startswith("-"):
+        raise ErrorDeUso("el primer argumento tiene que ser el UVUS del alumno")
+    if not re.match(r"^[a-z][a-z0-9_-]*$", uvus):
+        raise ErrorDeUso("«%s» no parece un nombre de usuario" % uvus)
+    directorio, pasar = None, []
+    i = 0
+    while i < len(resto):
+        if resto[i] == "--dir":
+            if i + 1 == len(resto):
+                raise ErrorDeUso("falta el directorio tras --dir")
+            directorio = resto[i + 1]
+            i += 2
+        else:
+            pasar.append(resto[i])
+            i += 1
+    return uvus, directorio, pasar
+
+
+def _ruta_del_silo(silo):
+    try:
+        ruta = ET.fromstring(silo.XMLDesc(0)).findtext("target/path")
+    except Exception:
+        return None
+    return os.path.normpath(ruta) if ruta else None
+
+
+def silos_del_alumno(conn, uvus, home):
+    """[(nombre, ruta, activo)] de los silos con su nombre o sobre su home."""
+    home = os.path.normpath(home)
+    encontrados = []
+    for silo in conn.listAllStoragePools(0):
+        try:
+            nombre = silo.name()
+        except Exception:
+            continue
+        ruta = _ruta_del_silo(silo)
+        suyo_por_nombre = nombre.startswith(uvus + "-")
+        suyo_por_ruta = ruta is not None and (ruta == home or ruta.startswith(home + "/"))
+        if suyo_por_nombre or suyo_por_ruta:
+            try:
+                activo = bool(silo.isActive())
+            except Exception:
+                activo = False
+            encontrados.append((nombre, ruta, activo))
+    return sorted(encontrados)
+
+
+def maquinas_del_alumno(conn, uvus):
+    """[(nombre, encendida)] de las máquinas <uvus>-..."""
+    maquinas = []
+    for dominio in conn.listAllDomains(0):
+        try:
+            nombre = dominio.name()
+        except Exception:
+            continue
+        if nombre.startswith(uvus + "-"):
+            try:
+                encendida = bool(dominio.isActive())
+            except Exception:
+                encendida = False
+            maquinas.append((nombre, encendida))
+    return sorted(maquinas)
+
+
+def elegir_directorio(uvus, home, silos, existe=os.path.isdir):
+    """El directorio desde el que se revisa. Por orden: el de su silo
+    <uvus>-imagenesMV, ~/imagenesMV, su único silo, su home."""
+    for nombre, ruta, _ in silos:
+        if nombre == uvus + "-imagenesMV" and ruta and existe(ruta):
+            return ruta
+    propio = os.path.join(home, "imagenesMV")
+    if existe(propio):
+        return propio
+    con_ruta = [ruta for _, ruta, _ in silos if ruta and existe(ruta)]
+    if len(con_ruta) == 1:
+        return con_ruta[0]
+    return home
+
+
+def orden_sudo(uvus, directorio, pasar):
+    return (["sudo", "-u", uvus, "-H", "--", "/bin/bash", "-c", LANZADOR,
+             "ci-diagnosis", directorio] + list(pasar))
+
+
+def programa():
+    return os.environ.get("CI_DIAGNOSIS") or os.path.join(AQUI, "ci-diagnosis")
+
+
+def abrir_libvirt():
+    try:
+        import libvirt
+    except ImportError:
+        return None
+    libvirt.registerErrorHandler(lambda contexto, error: None, None)
+    try:
+        return libvirt.openReadOnly(URI)
+    except libvirt.libvirtError:
+        return None
+
+
+def actualizar():
+    for origen, destino in DESCARGAS:
+        ruta = os.path.join(AQUI, destino)
+        try:
+            with urllib.request.urlopen(URL + origen, timeout=30) as r:
+                datos = r.read()
+        except Exception as e:
+            print("No se pudo descargar %s: %s" % (origen, e), file=sys.stderr)
+            return 1
+        if not datos.startswith(b"#!/usr/bin/python3"):
+            print("La descarga de %s no es lo esperado." % origen, file=sys.stderr)
+            return 1
+        fd, temporal = tempfile.mkstemp(dir=AQUI, prefix="." + destino + ".")
+        with os.fdopen(fd, "wb") as f:
+            f.write(datos)
+        os.chmod(temporal, 0o755)
+        os.replace(temporal, ruta)
+        version = re.search(rb'^VERSION = "([^"]+)"', datos, re.M)
+        print("%s actualizado%s." % (ruta, " (versión %s)" % version.group(1).decode()
+                                     if version else ""))
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        accion = analizar_argumentos(argv)
+    except ErrorDeUso as e:
+        print("ci-diagnosis-admin: %s" % e, file=sys.stderr)
+        print("Consulte la ayuda con: ci-diagnosis-admin --ayuda", file=sys.stderr)
+        return 2
+    if accion == ("ayuda",):
+        print(__doc__.split("\n", 2)[2], end="")
+        return 0
+    if accion == ("actualizar",):
+        return actualizar()
+
+    uvus, directorio, pasar = accion
+    try:
+        home = pwd.getpwnam(uvus).pw_dir
+    except KeyError:
+        print("ci-diagnosis-admin: no existe el usuario %s en este servidor." % uvus,
+              file=sys.stderr)
+        return 2
+    ci = programa()
+    if not os.path.isfile(ci):
+        print("ci-diagnosis-admin: no encuentro %s (descárguelo con --actualizar)." % ci,
+              file=sys.stderr)
+        return 2
+
+    conn = abrir_libvirt()
+    silos, maquinas = [], []
+    if conn is not None:
+        try:
+            silos = silos_del_alumno(conn, uvus, home)
+            maquinas = maquinas_del_alumno(conn, uvus)
+        finally:
+            conn.close()
+    else:
+        print("(No se pudo consultar libvirt: sin la lista de silos ni de máquinas.)")
+    if directorio is None:
+        directorio = elegir_directorio(uvus, home, silos)
+
+    print("Alumno: %s (%s)" % (uvus, home))
+    print("Silos:     " + ("; ".join("%s → %s%s" % (n, r or "?", "" if a else " (parado)")
+                                     for n, r, a in silos) or "ninguno"))
+    print("Máquinas:  " + (", ".join("%s (%s)" % (n, "encendida" if e else "apagada")
+                                     for n, e in maquinas) or "ninguna"))
+    print("Revisión desde %s, como %s (sudo puede pedir su contraseña)." % (directorio, uvus))
+    print()
+    sys.stdout.flush()
+    with open(ci, "rb") as entrada:
+        try:
+            return subprocess.run(orden_sudo(uvus, directorio, pasar),
+                                  stdin=entrada).returncode
+        except KeyboardInterrupt:
+            return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
