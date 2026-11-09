@@ -283,6 +283,17 @@ class TestOrden(unittest.TestCase):
         self.assertIn("server2.qcow2", textos)
         self.assertEqual(con_estado(rs, cd.ERROR), [])
 
+    def test_archivos_de_otro_directorio(self):
+        # Visto en avantasia (9-nov, E.4): mismos nombres, otro directorio
+        silo = os.path.join(self.home, "imagenesMV")
+        orden = MANUAL.replace("user-data=user-data", "user-data=/tmp/x/user-data")
+        with mock.patch.dict(cd.CONTEXTO, {"directorio": silo}, clear=True):
+            rs = self.revisar(orden)
+            self.assertIn("/tmp/x/user-data", texto_de(con_estado(rs, cd.AVISO)))
+            rs = self.revisar(MANUAL.replace("user-data=user-data",
+                                             "user-data=%s/user-data" % silo))
+            self.assertEqual(problemas(rs), [])
+
     def test_error_conocido_de_virt_install(self):
         escribir(os.path.join(self.home, ".cache", "virt-manager", "virt-install.log"),
                  LINEA % MANUAL + "[Thu, 05 Nov 2026 10:00:02 virt-install 1234] ERROR "
